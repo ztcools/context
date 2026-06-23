@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
+import { getRepoIdentity } from './utils/git-identity';
 
 /**
  * Thrown by indexCodebase / processFileList when an AbortSignal fires
@@ -288,8 +289,8 @@ export class Context {
     public getCollectionName(codebasePath: string): string {
         const isHybrid = this.getIsHybrid();
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
-        const normalizedPath = path.resolve(codebasePath);
-        const pathHash = crypto.createHash('md5').update(normalizedPath).digest('hex').substring(0, 8);
+        const identity = getRepoIdentity(codebasePath);
+        const pathHash = crypto.createHash('md5').update(identity).digest('hex').substring(0, 8);
 
         // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
         // codebases indexed by the same MCP server can't collapse into one collection.

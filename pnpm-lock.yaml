@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      '@zilliz/milvus2-sdk-node':
+        specifier: ^2.5.10
+        version: 2.5.10
     devDependencies:
       '@types/node':
         specifier: ^20.0.0
