@@ -792,12 +792,12 @@ export class Context {
         console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
         const dimension = await this.embedding.detectDimension();
         console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
-        const dirName = path.basename(codebasePath);
+        const repoIdentity = getRepoIdentity(codebasePath);
 
         if (isHybrid === true) {
-            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `repo:${repoIdentity}`);
         } else {
-            await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+            await this.vectorDatabase.createCollection(collectionName, dimension, `repo:${repoIdentity}`);
         }
 
         console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);

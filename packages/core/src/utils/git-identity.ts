@@ -18,7 +18,7 @@ export function getRepoIdentity(codebasePath: string): string {
         }).trim();
 
         if (url && branch) {
-            return `${url}#${branch}`;
+            return `${url}:${branch}`;
         }
     } catch {
     }
