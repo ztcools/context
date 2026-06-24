@@ -984,6 +984,7 @@ export class Context {
      */
     private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
         const isHybrid = this.getIsHybrid();
+        const repoIdentity = getRepoIdentity(codebasePath); // 这里获取 url:branch
 
         // Generate embedding vectors
         const chunkContents = chunks.map(chunk => chunk.content);
@@ -1021,7 +1022,7 @@ export class Context {
                     fileExtension,
                     metadata: {
                         ...restMetadata,
-                        codebasePath,
+                        codebasePath: repoIdentity, // 这里替换成 url:branch
                         language: chunk.metadata.language || 'unknown',
                         chunkIndex: index
                     }
@@ -1051,7 +1052,7 @@ export class Context {
                     fileExtension,
                     metadata: {
                         ...restMetadata,
-                        codebasePath,
+                        codebasePath: repoIdentity, // 这里替换成 url:branch
                         language: chunk.metadata.language || 'unknown',
                         chunkIndex: index
                     }
