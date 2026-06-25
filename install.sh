@@ -31,12 +31,19 @@ fi
 echo -e "${YELLOW}[2/5] 检查 pnpm...${NC}" 
 if command -v pnpm &> /dev/null; then 
     echo -e "${GREEN}  ✓ pnpm $(pnpm --version)${NC}" 
+    PNPM_CMD="pnpm"
 else 
     echo "  正在安装 pnpm..." 
-    NPM_GLOBAL_BIN="$(npm config get prefix)/bin"
-    export PATH="$NPM_GLOBAL_BIN:$PATH"
-    npm install -g pnpm 
-    echo -e "${GREEN}  ✓ pnpm 安装完成${NC}" 
+    curl -fsSL https://get.pnpm.io/install.sh | env PNPM_VERSION=10.12.1 sh -
+    export PNPM_HOME="$HOME/.local/share/pnpm"
+    export PATH="$PNPM_HOME:$PATH"
+    if command -v pnpm &> /dev/null; then
+        echo -e "${GREEN}  ✓ pnpm 安装完成${NC}"
+        PNPM_CMD="pnpm"
+    else
+        echo "  官方脚本安装失败，使用 npx 模式运行 pnpm..."
+        PNPM_CMD="npx pnpm"
+    fi
 fi 
 
 echo -e "${YELLOW}[3/5] 克隆仓库...${NC}" 
@@ -53,11 +60,11 @@ echo -e "${GREEN}  ✓ 仓库就绪${NC}"
 
 echo -e "${YELLOW}[4/5] 安装依赖 (可能需要几分钟)...${NC}" 
 cd "$INSTALL_DIR" 
-pnpm install 
+$PNPM_CMD install 
 echo -e "${GREEN}  ✓ 依赖安装完成${NC}" 
 
 echo -e "${YELLOW}[5/5] 构建项目...${NC}" 
-pnpm build 
+$PNPM_CMD build 
 echo -e "${GREEN}  ✓ 构建完成${NC}" 
 
 echo "" 
