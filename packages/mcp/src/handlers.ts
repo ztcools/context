@@ -1022,9 +1022,29 @@ export class ToolHandlers {
             await this.syncIndexedCodebasesFromCloud();
 
             // Check indexing status using new status system
-            const statusCodebasePath = this.snapshotManager.findTrackedCodebasePath(absolutePath) || absolutePath;
-            const status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
-            const info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
+            let statusCodebasePath = this.snapshotManager.findTrackedCodebasePath(absolutePath) || absolutePath;
+            let status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
+            let info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
+
+            // Fallback: the snapshot is keyed by filesystem path, but the Milvus
+            // collection is keyed by url+branch identity. When the snapshot has no
+            // entry (empty/stale in-memory map, or a skipped 0/0 write) we must still
+            // consult the VectorDB — the same recovery handleSearchCode does — so the
+            // status stays consistent with the actual url+branch-isolated collection.
+            if (status === 'not_found') {
+                const hasVectorIndex = await this.context.hasIndex(absolutePath);
+                if (hasVectorIndex) {
+                    const stats = await this.queryCollectionStats(absolutePath);
+                    if (stats) {
+                        console.warn(`[STATUS] Snapshot missing but VectorDB has index for '${absolutePath}', recovering snapshot (rows=${stats.totalChunks})`);
+                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                        this.snapshotManager.saveCodebaseSnapshot();
+                        statusCodebasePath = absolutePath;
+                        status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
+                        info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
+                    }
+                }
+            }
 
             let statusMessage = '';
 
