@@ -1021,16 +1021,42 @@ export class ToolHandlers {
 
             await this.syncIndexedCodebasesFromCloud();
 
-            // Check indexing status using new status system
-            let statusCodebasePath = this.snapshotManager.findTrackedCodebasePath(absolutePath) || absolutePath;
+            // Check indexing status using new status system.
+            //
+            // Resolve the tracked path with the same disk-backed lookups that
+            // search uses (findIndexedCodebasePath/findIndexingCodebasePath read
+            // the JSON file), falling back to the in-memory tracked path. This
+            // matters because getCodebaseStatus/getCodebaseInfo read the in-memory
+            // codebaseInfoMap, which can lag behind the on-disk snapshot when the
+            // repo was indexed by another process/MCP client, or when this process
+            // loaded its map before the entry was written — exactly the case where
+            // search succeeds but status falsely reports "not indexed".
+            let statusCodebasePath =
+                this.snapshotManager.findIndexedCodebasePath(absolutePath)
+                || this.snapshotManager.findIndexingCodebasePath(absolutePath)
+                || this.snapshotManager.findTrackedCodebasePath(absolutePath)
+                || absolutePath;
             let status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
             let info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
 
+            // Self-heal stale in-memory state: if memory doesn't know this codebase
+            // (or has no info for it) but the on-disk snapshot does, trust disk —
+            // it's the source of truth search reads from — and refresh memory.
+            if (status === 'not_found' || !info) {
+                const diskInfo = this.snapshotManager.getCodebaseInfoFromDisk(statusCodebasePath);
+                if (diskInfo) {
+                    console.warn(`[STATUS] In-memory snapshot stale for '${statusCodebasePath}', healing from disk (status=${diskInfo.status})`);
+                    this.snapshotManager.refreshCodebaseFromDisk(statusCodebasePath, diskInfo);
+                    status = diskInfo.status;
+                    info = diskInfo;
+                }
+            }
+
             // Fallback: the snapshot is keyed by filesystem path, but the Milvus
-            // collection is keyed by url+branch identity. When the snapshot has no
-            // entry (empty/stale in-memory map, or a skipped 0/0 write) we must still
-            // consult the VectorDB — the same recovery handleSearchCode does — so the
-            // status stays consistent with the actual url+branch-isolated collection.
+            // collection is keyed by url+branch identity. When neither the in-memory
+            // map nor the on-disk snapshot has an entry we must still consult the
+            // VectorDB — the same recovery handleSearchCode does — so the status
+            // stays consistent with the actual url+branch-isolated collection.
             if (status === 'not_found') {
                 const hasVectorIndex = await this.context.hasIndex(absolutePath);
                 if (hasVectorIndex) {

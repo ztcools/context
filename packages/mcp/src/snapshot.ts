@@ -499,6 +499,69 @@ export class SnapshotManager {
     }
 
     /**
+     * Read a codebase's info directly from the on-disk snapshot, bypassing the
+     * in-memory codebaseInfoMap. The in-memory map is only populated at startup
+     * (loadCodebaseSnapshot) and by in-process mutations, so it can lag behind
+     * the JSON file when another process — or another MCP client sharing the
+     * same snapshot — indexes a repo, or when this process loaded its map before
+     * the entry was written. getIndexedCodebases()/findIndexedCodebasePath() and
+     * therefore search already read from disk; this lets status reads do the same
+     * so the two stay consistent. Returns undefined if the file or entry is absent.
+     */
+    public getCodebaseInfoFromDisk(codebasePath: string): CodebaseInfo | undefined {
+        try {
+            if (!fs.existsSync(this.snapshotFilePath)) return undefined;
+
+            const snapshot: CodebaseSnapshot = JSON.parse(fs.readFileSync(this.snapshotFilePath, 'utf8'));
+
+            if (this.isV2Format(snapshot)) {
+                return snapshot.codebases[codebasePath];
+            }
+
+            // V1 format only records indexed codebases, with no per-codebase stats.
+            const indexed = Array.isArray(snapshot.indexedCodebases) ? snapshot.indexedCodebases : [];
+            if (indexed.includes(codebasePath)) {
+                const info: CodebaseInfoIndexed = {
+                    status: 'indexed',
+                    indexedFiles: 0,
+                    totalChunks: 0,
+                    indexStatus: 'completed',
+                    lastUpdated: snapshot.lastUpdated || new Date().toISOString()
+                };
+                return info;
+            }
+            return undefined;
+        } catch (error) {
+            console.warn(`[SNAPSHOT-DEBUG] Error reading codebase info from disk for '${codebasePath}':`, error);
+            return undefined;
+        }
+    }
+
+    /**
+     * Refresh the in-memory state for a single codebase from a known info entry
+     * (e.g. one just read off disk via getCodebaseInfoFromDisk). Unlike
+     * mergeExternalEntry this overwrites an existing in-memory entry, so a stale
+     * map gets corrected. Used by status reads to self-heal drift.
+     */
+    public refreshCodebaseFromDisk(codebasePath: string, info: CodebaseInfo): void {
+        if (this.recentlyRemoved.has(codebasePath)) return;
+        this.codebaseInfoMap.set(codebasePath, info);
+
+        this.indexedCodebases = this.indexedCodebases.filter(p => p !== codebasePath);
+        this.indexingCodebases.delete(codebasePath);
+        this.codebaseFileCount.delete(codebasePath);
+
+        if (info.status === 'indexed') {
+            this.indexedCodebases.push(codebasePath);
+            if ('indexedFiles' in info && info.indexedFiles !== undefined) {
+                this.codebaseFileCount.set(codebasePath, info.indexedFiles);
+            }
+        } else if (info.status === 'indexing') {
+            this.indexingCodebases.set(codebasePath, info.indexingPercentage || 0);
+        }
+    }
+
+    /**
      * Get all failed codebases
      */
     public getFailedCodebases(): string[] {
