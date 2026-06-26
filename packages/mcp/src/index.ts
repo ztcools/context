@@ -88,7 +88,7 @@ class ContextMcpServer {
 Index a codebase directory to enable semantic search. The codebase is identified by its git remote URL + branch name (not by filesystem path), so the same repository cloned to different locations shares a single index.
 
 ⚠️ **IMPORTANT**:
-- The 'path' parameter accepts absolute paths, relative paths (resolved against the current working directory), or "." to auto-detect the IDE workspace root.
+- The 'path' parameter accepts paths, relative paths (resolved against the current working directory), or "." to auto-detect the IDE workspace root.
 - Before indexing, the system checks if the repository (identified by git URL + branch) is already indexed in the vector database. If already indexed, indexing is skipped unless force=true.
 
 ✨ **Usage Guidance**:
@@ -103,7 +103,7 @@ Index a codebase directory to enable semantic search. The codebase is identified
 Search the indexed codebase using natural language queries. The codebase is identified by its git remote URL + branch, so searches work across different local checkouts of the same repository.
 
 ⚠️ **IMPORTANT**:
-- The 'path' parameter accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.
+- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.
 - If the codebase is not yet indexed, the tool returns an error - use index_codebase first.
 
 🎯 **When to Use**:
@@ -133,7 +133,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to index. Accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided. The path is only used to locate the project on disk; the index is identified by git URL + branch.`
+                                    description: `Path to the codebase directory to index. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided. The path is only used to locate the project on disk; the index is identified by git URL + branch.`
                                 },
                                 force: {
                                     type: "boolean",
@@ -173,7 +173,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to search in. Accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                                    description: `Path to the codebase directory to search in. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
                                 },
                                 query: {
                                     type: "string",
@@ -199,13 +199,13 @@ This tool is versatile and can be used before completing various tasks to retrie
                     },
                     {
                         name: "clear_index",
-                        description: `Clear the search index. The 'path' parameter accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                        description: `Clear the search index. The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to clear. Accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
+                                    description: `Path to the codebase directory to clear. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
                                 }
                             }
                         }
@@ -215,13 +215,13 @@ This tool is versatile and can be used before completing various tasks to retrie
                         description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases. The codebase is identified by its git remote URL + branch, so status works across different local checkouts of the same repository.
 
 ⚠️ **IMPORTANT**:
-- The 'path' parameter accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to check status for. Accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
+                                    description: `Path to the codebase directory to check status for. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
                                 }
                             }
                         }

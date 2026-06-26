@@ -1,5 +1,6 @@
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
 
 /**
  * Truncate content to specified length
@@ -73,7 +74,7 @@ export function resolveCodebasePath(inputPath: string): string {
 
     // Home directory
     if (trimmed === '~' || trimmed === 'home' || trimmed.startsWith('~/')) {
-        const homeDir = require('os').homedir();
+        const homeDir = os.homedir();
         const resolved = trimmed === '~' || trimmed === 'home'
             ? homeDir
             : path.join(homeDir, trimmed.slice(2));
