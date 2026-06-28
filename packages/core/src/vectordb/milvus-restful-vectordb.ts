@@ -822,19 +822,41 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
     }
 
     /**
-     * Check collection limit
-     * Returns true if collection can be created, false if limit exceeded
+     * Check collection limit by attempting to create a temporary test collection.
+     * Returns true if collection can be created, false if limit exceeded.
      */
     async checkCollectionLimit(): Promise<boolean> {
+        const testCollectionName = `_limit_test_${Date.now()}`;
         try {
-            const collections = await this.listCollections();
-            // Zilliz Cloud free tier: 1 collection; paid: 10-100+
-            // Return true if we can list collections (API is reachable)
-            console.log(`[MilvusRestfulDB] Current collection count: ${collections.length}`);
+            await this.ensureInitialized();
+            const restConfig = this.config as MilvusRestfulConfig;
+            // Create a minimal test collection to verify the limit is not reached
+            await this.makeRequest('/collections/create', 'POST', {
+                dbName: restConfig.database,
+                collectionName: testCollectionName,
+                schema: {
+                    fields: [
+                        { name: 'id', dataType: 'VarChar', maxLength: 512, isPrimaryKey: true },
+                        { name: 'vector', dataType: 'FloatVector', dim: 128 }
+                    ]
+                }
+            });
+            // Cleanup: drop the test collection
+            try {
+                await this.makeRequest('/collections/drop', 'POST', {
+                    dbName: restConfig.database,
+                    collectionName: testCollectionName
+                });
+            } catch { /* ignore cleanup failure */ }
             return true;
         } catch (error: any) {
-            console.warn(`[MilvusRestfulDB] Failed to check collection limit: ${error.message}`);
-            // If we can't check, allow creation to proceed (will fail at creation if limit exceeded)
+            const errorMessage = error.message || error.toString() || '';
+            if (/exceeded the limit number of collections/i.test(errorMessage)) {
+                console.warn(`[MilvusRestfulDB] Collection limit exceeded`);
+                return false;
+            }
+            console.warn(`[MilvusRestfulDB] Collection limit check failed: ${errorMessage}`);
+            // If the check itself fails for other reasons, allow creation to proceed
             return true;
         }
     }

@@ -643,8 +643,10 @@ export class SnapshotManager {
                         continue;
                     }
                 } catch { }
-                const waitUntil = Date.now() + retryInterval;
-                while (Date.now() < waitUntil) { /* busy wait */ }
+                // Use synchronous sleep via Atomics.wait for non-blocking CPU
+                const waitBuffer = new SharedArrayBuffer(4);
+                const waitArray = new Int32Array(waitBuffer);
+                Atomics.wait(waitArray, 0, 0, retryInterval);
             }
         }
         return false;
