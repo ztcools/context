@@ -30,6 +30,7 @@ import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.j
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
+import { GraphToolHandlers } from "./graph-handlers.js";
 
 class ContextMcpServer {
     private server: Server;
@@ -37,6 +38,7 @@ class ContextMcpServer {
     private snapshotManager: SnapshotManager;
     private syncManager: SyncManager;
     private toolHandlers: ToolHandlers;
+    private graphToolHandlers: GraphToolHandlers;
 
     constructor(config: ContextMcpConfig) {
         // Initialize MCP server
@@ -76,6 +78,7 @@ class ContextMcpServer {
         this.snapshotManager = new SnapshotManager();
         this.syncManager = new SyncManager(this.context, this.snapshotManager);
         this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
+        this.graphToolHandlers = new GraphToolHandlers();
 
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
@@ -226,6 +229,155 @@ This tool is versatile and can be used before completing various tasks to retrie
                             }
                         }
                     },
+                    // ── Graph Knowledge Tools ───────────────────────────
+                    {
+                        name: "index_repository",
+                        description: `Index a repository into the knowledge graph for structured code analysis. This is complementary to index_codebase (vector index) — it builds a graph of functions, classes, methods, imports, and calls. Use this to enable structured queries like call tracing, architecture analysis, and graph search.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                repo_path: {
+                                    type: "string",
+                                    description: "Path to the repository to index"
+                                },
+                                mode: {
+                                    type: "string",
+                                    enum: ["full", "moderate", "fast"],
+                                    default: "full",
+                                    description: "Indexing mode: full (all files), moderate (filtered), fast (minimal)"
+                                }
+                            },
+                            required: ["repo_path"]
+                        }
+                    },
+                    {
+                        name: "search_graph",
+                        description: `Search the code knowledge graph for functions, classes, methods, and variables. Use INSTEAD of grep/glob when finding code definitions, implementations, or relationships. Supports BM25 full-text search, regex patterns, and degree filtering.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier (git URL + branch)" },
+                                query: { type: "string", description: "Natural-language or keyword full-text search" },
+                                label: { type: "string", description: "Filter by node label (Function, Class, Method, etc.)" },
+                                name_pattern: { type: "string", description: "Regex pattern on node name" },
+                                qn_pattern: { type: "string", description: "Regex pattern on qualified name" },
+                                file_pattern: { type: "string", description: "Regex pattern on file path" },
+                                min_degree: { type: "integer", description: "Minimum degree (in+out edges)" },
+                                max_degree: { type: "integer", description: "Maximum degree (in+out edges)" },
+                                limit: { type: "integer", default: 200, description: "Max results per call" },
+                                offset: { type: "integer", default: 0, description: "Pagination offset" }
+                            },
+                            required: ["project"]
+                        }
+                    },
+                    {
+                        name: "trace_path",
+                        description: `Trace call paths through the code graph. Modes: calls (callers/callees), data_flow (value propagation), cross_service (HTTP/async). Use INSTEAD OF grep for callers, dependencies, impact analysis.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" },
+                                function_name: { type: "string", description: "Function name to trace from" },
+                                direction: { type: "string", enum: ["inbound", "outbound", "both"], default: "both" },
+                                depth: { type: "integer", default: 3, description: "Max traversal depth" },
+                                mode: { type: "string", enum: ["calls", "data_flow", "cross_service"], default: "calls" },
+                                include_tests: { type: "boolean", default: false }
+                            },
+                            required: ["project", "function_name"]
+                        }
+                    },
+                    {
+                        name: "get_code_snippet",
+                        description: `Read source code for a function/class/symbol by qualified name. First call search_graph to find the exact qualified_name, then pass it here.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" },
+                                qualified_name: { type: "string", description: "Full qualified_name from search_graph" },
+                                include_neighbors: { type: "boolean", default: false, description: "Include caller/callee names" }
+                            },
+                            required: ["project", "qualified_name"]
+                        }
+                    },
+                    {
+                        name: "get_graph_schema",
+                        description: `Get the schema of the knowledge graph (node labels, edge types).`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" }
+                            },
+                            required: ["project"]
+                        }
+                    },
+                    {
+                        name: "get_architecture",
+                        description: `Get high-level architecture overview — packages, services, dependencies, entry points, and directory clusters.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" },
+                                path: { type: "string", description: "Optional directory prefix to scope analysis" }
+                            },
+                            required: ["project"]
+                        }
+                    },
+                    {
+                        name: "search_code_graph",
+                        description: `Graph-augmented code search. Finds text patterns via grep, then enriches results with the knowledge graph — deduplicates matches into containing functions. Modes: compact (default), full, files.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" },
+                                pattern: { type: "string", description: "Text pattern to search for" },
+                                file_pattern: { type: "string", description: "Glob for file filtering (e.g. *.go)" },
+                                path_filter: { type: "string", description: "Regex filter on result file paths" },
+                                mode: { type: "string", enum: ["compact", "full", "files"], default: "compact" },
+                                regex: { type: "boolean", default: false },
+                                limit: { type: "integer", default: 10, description: "Max enriched results" }
+                            },
+                            required: ["project", "pattern"]
+                        }
+                    },
+                    {
+                        name: "list_projects",
+                        description: `List all graph-indexed projects.`,
+                        inputSchema: { type: "object", properties: {} }
+                    },
+                    {
+                        name: "delete_project",
+                        description: `Delete a project from the graph index.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier to delete" }
+                            },
+                            required: ["project"]
+                        }
+                    },
+                    {
+                        name: "index_status",
+                        description: `Get the graph indexing status of a project.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" }
+                            },
+                            required: ["project"]
+                        }
+                    },
+                    {
+                        name: "detect_changes",
+                        description: `Detect code changes and their potential impact on the graph.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" },
+                                base_branch: { type: "string", default: "main" }
+                            },
+                            required: ["project"]
+                        }
+                    },
                 ]
             };
         });
@@ -233,6 +385,7 @@ This tool is versatile and can be used before completing various tasks to retrie
         // Handle tool execution
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
+            const safeArgs = args || {};
 
             switch (name) {
                 case "index_codebase":
@@ -243,6 +396,30 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleClearIndex(args);
                 case "get_indexing_status":
                     return await this.toolHandlers.handleGetIndexingStatus(args);
+
+                // ── Graph Knowledge Tools ───────────────────────────
+                case "index_repository":
+                    return await this.graphToolHandlers.handleIndexRepository(safeArgs);
+                case "search_graph":
+                    return this.graphToolHandlers.handleSearchGraph(safeArgs);
+                case "trace_path":
+                    return this.graphToolHandlers.handleTracePath(safeArgs);
+                case "get_code_snippet":
+                    return this.graphToolHandlers.handleGetCodeSnippet(safeArgs);
+                case "get_graph_schema":
+                    return this.graphToolHandlers.handleGetGraphSchema(safeArgs);
+                case "get_architecture":
+                    return this.graphToolHandlers.handleGetArchitecture(safeArgs);
+                case "search_code_graph":
+                    return this.graphToolHandlers.handleSearchCode(safeArgs);
+                case "list_projects":
+                    return this.graphToolHandlers.handleListProjects();
+                case "delete_project":
+                    return this.graphToolHandlers.handleDeleteProject(safeArgs);
+                case "index_status":
+                    return this.graphToolHandlers.handleIndexStatus(safeArgs);
+                case "detect_changes":
+                    return this.graphToolHandlers.handleDetectChanges(safeArgs);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);

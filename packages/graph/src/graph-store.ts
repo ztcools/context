@@ -1,0 +1,413 @@
+/**
+ * SQLite-backed graph store for code knowledge graphs.
+ * Stores nodes and edges with full-text search (FTS5) for BM25 ranking.
+ */
+import Database from 'better-sqlite3';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as crypto from 'crypto';
+import {
+    GraphStore,
+    GraphNode,
+    GraphEdge,
+    GraphNodeLabel,
+    GraphEdgeType,
+    GraphSearchOptions,
+    GraphSearchResult,
+    GraphSearchResponse,
+} from './types';
+
+// ── SQL schema ────────────────────────────────────────────────────
+
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    label TEXT NOT NULL,
+    name TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    start_line INTEGER NOT NULL DEFAULT 0,
+    end_line INTEGER NOT NULL DEFAULT 0,
+    properties_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(project, qualified_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project);
+CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(project, label);
+CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(project, file_path);
+CREATE INDEX IF NOT EXISTS idx_nodes_qn ON nodes(project, qualified_name);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    target_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    properties_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_project ON edges(project);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(project, source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(project, target_id);
+CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type);
+
+-- FTS5 index for BM25 full-text search on node names and qualified names
+CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+    name,
+    qualified_name,
+    file_path,
+    content='nodes',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 1'
+);
+
+CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
+    VALUES (new.id, new.name, new.qualified_name, new.file_path);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path);
+    INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
+    VALUES (new.id, new.name, new.qualified_name, new.file_path);
+END;
+`;
+
+// ── Implementation ────────────────────────────────────────────────
+
+export class SqliteGraphStore implements GraphStore {
+    private db: Database.Database;
+    private dbPath: string;
+
+    constructor(dbPath?: string) {
+        if (dbPath) {
+            this.dbPath = dbPath;
+        } else {
+            const graphDir = path.join(os.homedir(), '.context', 'graph');
+            fs.mkdirSync(graphDir, { recursive: true });
+            this.dbPath = path.join(graphDir, 'knowledge-graph.db');
+        }
+        this.db = new Database(this.dbPath);
+    }
+
+    initialize(): void {
+        this.db.pragma('journal_mode = WAL');
+        this.db.pragma('foreign_keys = ON');
+        this.db.exec(SCHEMA_SQL);
+    }
+
+    close(): void {
+        if (this.db) {
+            this.db.close();
+        }
+    }
+
+    // ── Node operations ──────────────────────────────────────────
+
+    upsertNode(node: Omit<GraphNode, 'id'>): number {
+        const stmt = this.db.prepare(`
+            INSERT INTO nodes (project, label, name, qualified_name, file_path, start_line, end_line, properties_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project, qualified_name) DO UPDATE SET
+                label = excluded.label,
+                name = excluded.name,
+                file_path = excluded.file_path,
+                start_line = excluded.start_line,
+                end_line = excluded.end_line,
+                properties_json = excluded.properties_json
+        `);
+        const result = stmt.run(
+            node.project,
+            node.label,
+            node.name,
+            node.qualifiedName,
+            node.filePath,
+            node.startLine,
+            node.endLine,
+            JSON.stringify(node.properties),
+        );
+        return Number(result.lastInsertRowid);
+    }
+
+    getNodeById(id: number): GraphNode | null {
+        const row = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+        return row ? this.rowToNode(row) : null;
+    }
+
+    getNodeByQN(project: string, qualifiedName: string): GraphNode | null {
+        const row = this.db.prepare(
+            'SELECT * FROM nodes WHERE project = ? AND qualified_name = ?'
+        ).get(project, qualifiedName) as Record<string, unknown> | undefined;
+        return row ? this.rowToNode(row) : null;
+    }
+
+    findNodes(options: GraphSearchOptions): GraphSearchResponse {
+        const conditions: string[] = ['n.project = ?'];
+        const params: unknown[] = [options.project];
+
+        if (options.label) {
+            conditions.push('n.label = ?');
+            params.push(options.label);
+        }
+
+        if (options.namePattern) {
+            conditions.push('n.name LIKE ?');
+            params.push(this.regexToLike(options.namePattern));
+        }
+
+        if (options.qnPattern) {
+            conditions.push('n.qualified_name LIKE ?');
+            params.push(this.regexToLike(options.qnPattern));
+        }
+
+        if (options.filePattern) {
+            conditions.push('n.file_path LIKE ?');
+            params.push(this.regexToLike(options.filePattern));
+        }
+
+        const whereClause = conditions.join(' AND ');
+        const limit = options.limit ?? 200;
+        const offset = options.offset ?? 0;
+
+        // Build query with optional FTS ranking
+        let query: string;
+        let countQuery: string;
+
+        if (options.query && options.query.trim().length > 0) {
+            // BM25 full-text search via FTS5
+            const ftsQuery = this.buildFtsQuery(options.query);
+            query = `
+                SELECT n.*, bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
+                FROM nodes n
+                JOIN nodes_fts fts ON n.id = fts.rowid
+                WHERE nodes_fts MATCH ? AND ${whereClause}
+                ORDER BY score
+                LIMIT ? OFFSET ?
+            `;
+            params.unshift(ftsQuery);
+            params.push(limit, offset);
+
+            countQuery = `
+                SELECT COUNT(*) as total
+                FROM nodes n
+                JOIN nodes_fts fts ON n.id = fts.rowid
+                WHERE nodes_fts MATCH ? AND ${whereClause}
+            `;
+        } else {
+            query = `
+                SELECT n.*, 0 AS score
+                FROM nodes n
+                WHERE ${whereClause}
+                ORDER BY n.name
+                LIMIT ? OFFSET ?
+            `;
+            params.push(limit, offset);
+
+            countQuery = `
+                SELECT COUNT(*) as total
+                FROM nodes n
+                WHERE ${whereClause}
+            `;
+        }
+
+        const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+
+        // Build count params matching the whereClause conditions
+        const countParams: unknown[] = [];
+        if (options.query && options.query.trim().length > 0) {
+            countParams.push(this.buildFtsQuery(options.query));
+        }
+        countParams.push(options.project);
+        if (options.label) countParams.push(options.label);
+        if (options.namePattern) countParams.push(this.regexToLike(options.namePattern));
+        if (options.qnPattern) countParams.push(this.regexToLike(options.qnPattern));
+        if (options.filePattern) countParams.push(this.regexToLike(options.filePattern));
+        const countRow = this.db.prepare(countQuery).get(...countParams) as { total: number };
+
+        const results: GraphSearchResult[] = [];
+
+        for (const row of rows) {
+            const node = this.rowToNode(row);
+            const { inDegree, outDegree } = this.getNodeDegree(node.id);
+
+            // Apply degree filters
+            if (options.minDegree !== undefined && (inDegree + outDegree) < options.minDegree) continue;
+            if (options.maxDegree !== undefined && (inDegree + outDegree) > options.maxDegree) continue;
+
+            results.push({
+                node,
+                score: (row.score as number) ?? 0,
+                inDegree,
+                outDegree,
+            });
+        }
+
+        return {
+            results,
+            total: countRow.total,
+            hasMore: offset + results.length < countRow.total,
+        };
+    }
+
+    getNodeDegree(nodeId: number): { inDegree: number; outDegree: number } {
+        const inRow = this.db.prepare(
+            'SELECT COUNT(*) as cnt FROM edges WHERE target_id = ?'
+        ).get(nodeId) as { cnt: number };
+        const outRow = this.db.prepare(
+            'SELECT COUNT(*) as cnt FROM edges WHERE source_id = ?'
+        ).get(nodeId) as { cnt: number };
+        return { inDegree: inRow.cnt, outDegree: outRow.cnt };
+    }
+
+    // ── Edge operations ──────────────────────────────────────────
+
+    upsertEdge(edge: Omit<GraphEdge, 'id'>): number {
+        // Check for duplicate
+        const existing = this.db.prepare(
+            'SELECT id FROM edges WHERE project = ? AND source_id = ? AND target_id = ? AND type = ?'
+        ).get(edge.project, edge.sourceId, edge.targetId, edge.type) as { id: number } | undefined;
+
+        if (existing) {
+            return existing.id;
+        }
+
+        const stmt = this.db.prepare(`
+            INSERT INTO edges (project, source_id, target_id, type, properties_json)
+            VALUES (?, ?, ?, ?, ?)
+        `);
+        const result = stmt.run(
+            edge.project,
+            edge.sourceId,
+            edge.targetId,
+            edge.type,
+            JSON.stringify(edge.properties),
+        );
+        return Number(result.lastInsertRowid);
+    }
+
+    getEdgesBySource(sourceId: number, type?: GraphEdgeType): GraphEdge[] {
+        let query = 'SELECT * FROM edges WHERE source_id = ?';
+        const params: unknown[] = [sourceId];
+        if (type) {
+            query += ' AND type = ?';
+            params.push(type);
+        }
+        const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+        return rows.map(r => this.rowToEdge(r));
+    }
+
+    getEdgesByTarget(targetId: number, type?: GraphEdgeType): GraphEdge[] {
+        let query = 'SELECT * FROM edges WHERE target_id = ?';
+        const params: unknown[] = [targetId];
+        if (type) {
+            query += ' AND type = ?';
+            params.push(type);
+        }
+        const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+        return rows.map(r => this.rowToEdge(r));
+    }
+
+    // ── Project operations ───────────────────────────────────────
+
+    listProjects(): string[] {
+        const rows = this.db.prepare(
+            'SELECT DISTINCT project FROM nodes ORDER BY project'
+        ).all() as Array<{ project: string }>;
+        return rows.map(r => r.project);
+    }
+
+    getProjectStats(project: string): { nodes: number; edges: number } {
+        const nodeRow = this.db.prepare(
+            'SELECT COUNT(*) as cnt FROM nodes WHERE project = ?'
+        ).get(project) as { cnt: number };
+        const edgeRow = this.db.prepare(
+            'SELECT COUNT(*) as cnt FROM edges WHERE project = ?'
+        ).get(project) as { cnt: number };
+        return { nodes: nodeRow.cnt, edges: edgeRow.cnt };
+    }
+
+    deleteProject(project: string): void {
+        this.db.prepare('DELETE FROM edges WHERE project = ?').run(project);
+        this.db.prepare('DELETE FROM nodes WHERE project = ?').run(project);
+    }
+
+    // ── Batch operations ─────────────────────────────────────────
+
+    beginTransaction(): void {
+        this.db.prepare('BEGIN TRANSACTION').run();
+    }
+
+    commitTransaction(): void {
+        this.db.prepare('COMMIT').run();
+    }
+
+    rollbackTransaction(): void {
+        this.db.prepare('ROLLBACK').run();
+    }
+
+    // ── Schema ───────────────────────────────────────────────────
+
+    getSchema(): { nodeLabels: string[]; edgeTypes: string[] } {
+        const labels = this.db.prepare(
+            'SELECT DISTINCT label FROM nodes ORDER BY label'
+        ).all() as Array<{ label: string }>;
+        const types = this.db.prepare(
+            'SELECT DISTINCT type FROM edges ORDER BY type'
+        ).all() as Array<{ type: string }>;
+        return {
+            nodeLabels: labels.map(r => r.label),
+            edgeTypes: types.map(r => r.type),
+        };
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────
+
+    private rowToNode(row: Record<string, unknown>): GraphNode {
+        return {
+            id: row.id as number,
+            project: row.project as string,
+            label: row.label as GraphNodeLabel,
+            name: row.name as string,
+            qualifiedName: row.qualified_name as string,
+            filePath: row.file_path as string,
+            startLine: row.start_line as number,
+            endLine: row.end_line as number,
+            properties: JSON.parse((row.properties_json as string) || '{}'),
+        };
+    }
+
+    private rowToEdge(row: Record<string, unknown>): GraphEdge {
+        return {
+            id: row.id as number,
+            project: row.project as string,
+            sourceId: row.source_id as number,
+            targetId: row.target_id as number,
+            type: row.type as GraphEdgeType,
+            properties: JSON.parse((row.properties_json as string) || '{}'),
+        };
+    }
+
+    private buildFtsQuery(query: string): string {
+        // Split camelCase and tokenize for FTS5
+        const tokens = query
+            .replace(/([a-z])([A-Z])/g, '$1 $2')
+            .split(/[\s_\-.:/]+/)
+            .filter(t => t.length > 0);
+        return tokens.map(t => `"${t}"`).join(' OR ');
+    }
+
+    private regexToLike(pattern: string): string {
+        // Convert simple regex patterns to SQL LIKE patterns
+        return '%' + pattern.replace(/[.*+?^${}()|[\]\\]/g, '').replace(/^%|%$/g, '') + '%';
+    }
+}
