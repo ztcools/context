@@ -364,14 +364,53 @@ export class ToolHandlers {
             const alreadyGraphIndexed = stats.nodes > 0;
 
             if (alreadyGraphIndexed && !args.force) {
-                console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), skipping`);
-                // Include graph status so user knows the state
+                console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), checking for changes...`);
+
+                // Detect changes for smart incremental indexing
+                let changedFiles: string[] = [];
+                try {
+                    const changesResult = this.graphToolHandlers.handleDetectChanges({
+                        project,
+                    });
+                    const changesText = changesResult.content[0]?.text || '';
+                    const changedMatch = changesText.match(/Changed files:\s*\n([\s\S]*?)(?:\n\n|$)/);
+                    if (changedMatch) {
+                        changedFiles = changedMatch[1]
+                            .split('\n')
+                            .map(l => l.trim().replace(/^-\s*/, ''))
+                            .filter(l => l.length > 0);
+                    }
+                } catch {
+                    // change detection failure shouldn't block
+                }
+
+                if (changedFiles.length > 0) {
+                    console.log(`[INDEX] Detected ${changedFiles.length} changed files, running incremental graph index`);
+                    try {
+                        const graphResult = await this.graphToolHandlers.handleIndexRepository({
+                            repo_path: absolutePath,
+                            mode: 'incremental',
+                            files: changedFiles,
+                        });
+                        const graphText = graphResult.content[0]?.text || '';
+                        const vectorText = vectorResult.content[0]?.text || '';
+                        return {
+                            ...vectorResult,
+                            content: [{ type: 'text', text: vectorText + '\n\n' + graphText + `\n  (incremental: ${changedFiles.length} files)` }],
+                        };
+                    } catch (e: any) {
+                        console.warn(`[INDEX] Incremental graph indexing failed: ${e.message}`);
+                    }
+                }
+
+                // No changes or incremental failed — skip
+                console.log(`[INDEX] No changes detected for '${project}', skipping graph indexing`);
                 const vectorText = vectorResult.content[0]?.text || '';
                 return {
                     ...vectorResult,
                     content: [{
                         type: 'text',
-                        text: vectorText + `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (use force=true to re-index)`,
+                        text: vectorText + `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (no changes detected, use force=true to re-index)`,
                     }],
                 };
             } else {
@@ -910,6 +949,27 @@ export class ToolHandlers {
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
             if (searchResults.length === 0) {
+                // Fallback: try graph search when vector search returns nothing
+                if (this.graphToolHandlers && query.trim().length > 0) {
+                    try {
+                        const project = getRepoIdentity(searchCodebasePath);
+                        const graphResult = this.graphToolHandlers.handleSearchGraph({
+                            project,
+                            query: query,
+                            limit: 10,
+                        });
+                        const graphText = graphResult.content[0]?.text || '';
+                        if (!graphText.includes('Found 0 results')) {
+                            return {
+                                content: [{
+                                    type: 'text', text:
+                                        `No vector search results. Found graph matches:\n\n${graphText}`
+                                }]
+                            };
+                        }
+                    } catch { }
+                }
+
                 // Check if collection was lost (indexed locally but missing in Milvus)
                 if (isIndexed && !isIndexing) {
                     const collectionName = this.context.getCollectionName(searchCodebasePath);
@@ -955,13 +1015,12 @@ export class ToolHandlers {
             }
             resultMessage += `\n\n${formattedResults}`;
 
-            // ── Graph Context Enrichment (enhanced) ──────────────────
+            // ── Graph Context Enrichment (deep 3-layer) ──────────────────
             if (this.graphToolHandlers) {
                 try {
-                    resultMessage += this.enrichWithGraphContext(
+                    resultMessage += this.enrichWithGraphContextDeep(
                         searchResults,
                         searchCodebasePath,
-                        resultMessage,
                     );
                 } catch (graphErr: any) {
                     console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
@@ -1203,6 +1262,18 @@ export class ToolHandlers {
                     }
                     if (routeResult.total > 5) lines.push(`    ... +${routeResult.total - 5} more`);
                 }
+
+                lines.push('');
+
+                // === Architecture overview ===
+                try {
+                    const archResult = this.graphToolHandlers.handleGetArchitecture({ project });
+                    const archText = archResult.content[0]?.text || '';
+                    lines.push('## Architecture');
+                    lines.push(archText);
+                } catch (e: any) {
+                    lines.push(`Architecture analysis failed: ${e.message}`);
+                }
             } catch (e: any) {
                 lines.push('## Graph Index (SQLite)');
                 lines.push(`Error: ${e.message}`);
@@ -1381,6 +1452,173 @@ export class ToolHandlers {
      * Enrich vector search results with knowledge graph context:
      * callers, callees, architectural position, and dead code detection.
      * Returns a formatted string to append to the result message.
+     */
+    private enrichWithGraphContextDeep(
+        searchResults: any[],
+        codebasePath: string,
+        maxContextFiles: number = 10,
+    ): string {
+        const store = this.graphToolHandlers!.getStore();
+        const project = getRepoIdentity(codebasePath);
+        const lines: string[] = [];
+        const seenSymbols = new Set<string>();
+
+        // Collect all unique file paths from search results
+        const seenFiles = new Set<string>();
+        for (const result of searchResults.slice(0, maxContextFiles)) {
+            seenFiles.add(result.relativePath);
+        }
+
+        // === Layer 1: Direct call relationships (original logic) ===
+        const directRelations: string[] = [];
+        for (const filePath of seenFiles) {
+            const normalizedPath = filePath.replace(/^\/+/, '');
+            let nodeResult = store.findNodes({
+                project,
+                exactFilePath: normalizedPath,
+                limit: 20,
+            });
+            if (nodeResult.results.length === 0 && normalizedPath !== filePath) {
+                nodeResult = store.findNodes({
+                    project,
+                    exactFilePath: filePath,
+                    limit: 20,
+                });
+            }
+            if (nodeResult.results.length === 0) continue;
+
+            for (const r of nodeResult.results) {
+                const n = r.node;
+                const key = n.qualifiedName;
+                if (seenSymbols.has(key)) continue;
+                seenSymbols.add(key);
+
+                const callerEdges = store.getEdgesByTarget(n.id, 'CALLS');
+                const calleeEdges = store.getEdgesBySource(n.id, 'CALLS');
+
+                const callerNames = callerEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
+                    const caller = store.getNodeById(e.sourceId);
+                    return caller ? caller.name : '?';
+                });
+                const calleeNames = calleeEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
+                    const callee = store.getNodeById(e.targetId);
+                    return callee ? callee.name : '?';
+                });
+
+                let line = `${n.label} \`${n.name}\``;
+                if (callerNames.length > 0) {
+                    line += ` ← ${callerNames.join(', ')}`;
+                    if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
+                }
+                if (calleeNames.length > 0) {
+                    line += ` → ${calleeNames.join(', ')}`;
+                    if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
+                }
+                if (callerEdges.length === 0 && calleeEdges.length === 0) {
+                    line += ` [unused]`;
+                } else if (callerEdges.length === 0 && n.label === 'Function') {
+                    line += ` [entry]`;
+                }
+                line += ` (${n.filePath}:${n.startLine})`;
+                directRelations.push(line);
+            }
+        }
+
+        if (directRelations.length > 0) {
+            lines.push('## Graph Context');
+            lines.push(...directRelations.map(l => `  - ${l}`));
+            lines.push('');
+        }
+
+        // === Layer 2: Call chain trace (for top-ranked function) ===
+        for (const result of searchResults.slice(0, 3)) {
+            const normalizedPath = result.relativePath.replace(/^\/+/, '');
+            const nodeResult = store.findNodes({
+                project,
+                exactFilePath: normalizedPath,
+                limit: 5,
+            });
+            for (const r of nodeResult.results) {
+                if (r.node.label !== 'Function' && r.node.label !== 'Method') continue;
+                try {
+                    const traceResult = this.graphToolHandlers!.handleTracePath({
+                        project,
+                        function_name: r.node.name,
+                        direction: 'both',
+                        depth: 3,
+                        mode: 'calls',
+                    });
+                    const traceText = traceResult.content[0]?.text || '';
+                    const traceLines = traceText.split('\n');
+                    const filtered = traceLines.filter((l: string) =>
+                        l.startsWith('  [depth=') || l.startsWith('Callers') || l.startsWith('Callees')
+                    );
+                    if (filtered.length > 0) {
+                        lines.push(`### Call Chain: \`${r.node.name}\``);
+                        lines.push(...filtered);
+                        lines.push('');
+                    }
+                } catch {
+                    // trace failure shouldn't affect main flow
+                }
+                break;
+            }
+            break;
+        }
+
+        // === Layer 3: Architecture summary ===
+        try {
+            const archResult = this.graphToolHandlers!.handleGetArchitecture({
+                project,
+            });
+            const archText = archResult.content[0]?.text || '';
+            const archLines = archText.split('\n');
+            const summary: string[] = [];
+            let inEntryPoints = false;
+            let inClusters = false;
+            let clusterCount = 0;
+            for (const line of archLines) {
+                if (line.startsWith('Entry points')) {
+                    inEntryPoints = true;
+                    summary.push(line);
+                    continue;
+                }
+                if (inEntryPoints && line.startsWith('  -')) {
+                    summary.push(line);
+                    continue;
+                }
+                if (inEntryPoints && !line.startsWith('  -')) {
+                    inEntryPoints = false;
+                }
+                if (line.startsWith('Clusters')) {
+                    inClusters = true;
+                    summary.push(line);
+                    continue;
+                }
+                if (inClusters && line.startsWith('  ') && clusterCount < 5) {
+                    summary.push(line);
+                    clusterCount++;
+                    continue;
+                }
+                if (inClusters && clusterCount >= 5) {
+                    inClusters = false;
+                }
+            }
+            if (summary.length > 0) {
+                lines.push('### Architecture');
+                lines.push(...summary);
+                lines.push('');
+            }
+        } catch {
+            // architecture failure shouldn't affect main flow
+        }
+
+        return lines.length > 0 ? '\n\n' + lines.join('\n') : '';
+    }
+
+    /**
+     * @deprecated Use enrichWithGraphContextDeep for 3-layer enhancement.
+     * Kept for backward compatibility.
      */
     private enrichWithGraphContext(
         searchResults: any[],
