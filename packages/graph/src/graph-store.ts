@@ -152,8 +152,13 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     findNodes(options: GraphSearchOptions): GraphSearchResponse {
-        const conditions: string[] = ['n.project = ?'];
-        const params: unknown[] = [options.project];
+        const conditions: string[] = [];
+        const params: unknown[] = [];
+
+        if (options.project) {
+            conditions.push('n.project = ?');
+            params.push(options.project);
+        }
 
         if (options.label) {
             conditions.push('n.label = ?');
@@ -175,7 +180,7 @@ export class SqliteGraphStore implements GraphStore {
             params.push(this.regexToLike(options.filePattern));
         }
 
-        const whereClause = conditions.join(' AND ');
+        const whereClause = conditions.length > 0 ? conditions.join(' AND ') : '1=1';
         const limit = options.limit ?? 200;
         const offset = options.offset ?? 0;
 
@@ -395,6 +400,105 @@ export class SqliteGraphStore implements GraphStore {
             type: row.type as GraphEdgeType,
             properties: JSON.parse((row.properties_json as string) || '{}'),
         };
+    }
+
+    // ── Query execution ──────────────────────────────────────────
+
+    executeQuery(project: string, query: string): { rows: Array<Record<string, unknown>> } {
+        // Simple Cypher-like query parser
+        // Supports: MATCH (n) WHERE n.name = 'X' RETURN n
+        const matchMatch = query.match(/MATCH\s*\((\w+)\)\s*(?:WHERE\s+(.+?))?\s*RETURN\s+(.+)/i);
+        if (matchMatch) {
+            const varName = matchMatch[1];
+            const whereClause = matchMatch[2];
+            const returnClause = matchMatch[3];
+
+            const conditions: string[] = ['n.project = ?'];
+            const params: unknown[] = [project];
+
+            if (whereClause) {
+                // Parse: n.name = 'X' or n.label = 'Function'
+                const eqMatches = whereClause.matchAll(/(\w+)\.(\w+)\s*=\s*'([^']+)'/g);
+                for (const m of eqMatches) {
+                    const field = m[2];
+                    const value = m[3];
+                    if (field === 'name') {
+                        conditions.push('n.name = ?');
+                        params.push(value);
+                    } else if (field === 'label') {
+                        conditions.push('n.label = ?');
+                        params.push(value);
+                    } else if (field === 'qualifiedName' || field === 'qualified_name') {
+                        conditions.push('n.qualified_name = ?');
+                        params.push(value);
+                    }
+                }
+
+                // Parse: n.name CONTAINS 'X'
+                const containsMatch = whereClause.match(new RegExp(`(\\w+)\\.(\\w+)\\s+CONTAINS\\s+'([^']+)'`));
+                if (containsMatch) {
+                    const field = containsMatch[2];
+                    const value = containsMatch[3];
+                    if (field === 'name') {
+                        conditions.push('n.name LIKE ?');
+                        params.push(`%${value}%`);
+                    }
+                }
+            }
+
+            const whereSQL = conditions.join(' AND ');
+
+            if (returnClause.includes('*') || returnClause.includes(varName)) {
+                const rows = this.db.prepare(`SELECT * FROM nodes n WHERE ${whereSQL}`).all(...params) as Array<Record<string, unknown>>;
+                return { rows };
+            }
+        }
+
+        // Fallback: execute as raw SQL (with project filter)
+        const rows = this.db.prepare(query).all() as Array<Record<string, unknown>>;
+        return { rows };
+    }
+
+    // ── ADR (Architecture Decision Records) ──────────────────────
+
+    getADRs(project?: string): Array<{ id: number; project: string; title: string; status: string; content: string; created: string }> {
+        // ADRs are stored as nodes with label 'ADR'
+        const options: GraphSearchOptions = { label: 'ADR' as GraphNodeLabel, limit: 1000 };
+        if (project) options.project = project;
+        const result = this.findNodes(options);
+        return result.results.map(r => ({
+            id: r.node.id,
+            project: r.node.project,
+            title: r.node.name,
+            status: (r.node.properties.status as string) || 'unknown',
+            content: (r.node.properties.content as string) || '',
+            created: (r.node.properties.created as string) || new Date().toISOString(),
+        }));
+    }
+
+    createADR(adr: { project: string; title: string; content: string; status: string }): number {
+        return this.upsertNode({
+            project: adr.project,
+            label: 'ADR' as GraphNodeLabel,
+            name: adr.title,
+            qualifiedName: `${adr.project}.adr.${adr.title.replace(/\s+/g, '-').toLowerCase()}`,
+            filePath: 'adr://',
+            startLine: 0,
+            endLine: 0,
+            properties: {
+                content: adr.content,
+                status: adr.status,
+                created: new Date().toISOString(),
+            },
+        });
+    }
+
+    updateADR(id: number, updates: { status?: string; content?: string }): void {
+        const node = this.getNodeById(id);
+        if (!node) return;
+
+        const props = { ...node.properties, ...updates };
+        this.db.prepare('UPDATE nodes SET properties_json = ? WHERE id = ?').run(JSON.stringify(props), id);
     }
 
     private buildFtsQuery(query: string): string {

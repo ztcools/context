@@ -1,6 +1,10 @@
 /**
  * AST-based graph extractor. Uses tree-sitter to extract structured
  * code information: functions, classes, methods, imports, and calls.
+ *
+ * Two-pass extraction:
+ *   Pass 1: Collect all definitions (nodes) into a registry
+ *   Pass 2: Resolve call expressions into CALLS edges
  */
 import Parser from 'tree-sitter';
 import { GraphNode, GraphNodeLabel, GraphEdge, GraphEdgeType } from './types';
@@ -22,6 +26,10 @@ interface LanguageConfig {
     nodeTypes: Record<string, GraphNodeLabel>;
     importNodeTypes: string[];
     callNodeTypes: string[];
+    /** Fields to extract the name from for definitions */
+    nameFields?: string[];
+    /** Types that are nested definitions (must be parent-aware) */
+    nestedDefTypes?: string[];
 }
 
 const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
@@ -36,6 +44,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['import_statement', 'require_call_expression'],
         callNodeTypes: ['call_expression', 'new_expression'],
+        nameFields: ['name'],
+        nestedDefTypes: ['method_definition'],
     },
     typescript: {
         parser: TypeScript,
@@ -50,6 +60,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['import_statement'],
         callNodeTypes: ['call_expression', 'new_expression'],
+        nameFields: ['name'],
+        nestedDefTypes: ['method_definition'],
     },
     python: {
         parser: Python,
@@ -61,6 +73,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['import_statement', 'import_from_statement'],
         callNodeTypes: ['call'],
+        nameFields: ['name'],
+        nestedDefTypes: [],
     },
     java: {
         parser: Java,
@@ -73,6 +87,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['import_declaration'],
         callNodeTypes: ['method_invocation', 'object_creation_expression'],
+        nameFields: ['name'],
+        nestedDefTypes: ['method_declaration', 'constructor_declaration'],
     },
     cpp: {
         parser: Cpp,
@@ -85,6 +101,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['preproc_include'],
         callNodeTypes: ['call_expression'],
+        nameFields: ['name'],
+        nestedDefTypes: [],
     },
     go: {
         parser: Go,
@@ -97,6 +115,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['import_declaration'],
         callNodeTypes: ['call_expression'],
+        nameFields: ['name'],
+        nestedDefTypes: ['method_declaration'],
     },
     rust: {
         parser: Rust,
@@ -111,6 +131,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['use_declaration'],
         callNodeTypes: ['call_expression'],
+        nameFields: ['name'],
+        nestedDefTypes: [],
     },
     csharp: {
         parser: CSharp,
@@ -124,6 +146,8 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         },
         importNodeTypes: ['using_directive'],
         callNodeTypes: ['invocation_expression', 'object_creation_expression'],
+        nameFields: ['name'],
+        nestedDefTypes: ['method_declaration', 'constructor_declaration'],
     },
 };
 
@@ -140,6 +164,16 @@ export interface ExtractionContext {
     language: string;
 }
 
+// ── Internal: name registry ────────────────────────────────────────
+
+interface NameEntry {
+    name: string;
+    qualifiedName: string;
+    nodeIndex: number;
+    /** For imports: the resolved module qualified name */
+    importModule?: string;
+}
+
 // ── Extractor class ────────────────────────────────────────────────
 
 export class GraphExtractor {
@@ -151,6 +185,7 @@ export class GraphExtractor {
 
     /**
      * Extract graph nodes and edges from source code.
+     * Two-pass: collect definitions, then resolve calls.
      */
     extract(source: string, ctx: ExtractionContext): ExtractionResult {
         const config = this.getLanguageConfig(ctx.language);
@@ -161,8 +196,18 @@ export class GraphExtractor {
         try {
             this.parser.setLanguage(config.parser);
             const tree = this.parser.parse(source);
-            const result = this.extractFromTree(tree.rootNode, source, ctx, config);
-            return result;
+
+            const nodes: Omit<GraphNode, 'id'>[] = [];
+            const edges: Omit<GraphEdge, 'id'>[] = [];
+            const registry = new Map<string, NameEntry>();
+
+            // ── Pass 1: Collect all definitions ──────────────────────
+            this.collectDefinitions(tree.rootNode, source, ctx, config, nodes, registry);
+
+            // ── Pass 2: Resolve calls and create edges ──────────────
+            this.resolveCalls(tree.rootNode, source, ctx, config, nodes, registry, edges);
+
+            return { nodes, edges };
         } catch (error) {
             console.warn(`[GraphExtractor] Failed to parse ${ctx.filePath}:`, error);
             return { nodes: [], edges: [] };
@@ -200,55 +245,45 @@ export class GraphExtractor {
         return map[ext] || '';
     }
 
-    // ── Private methods ──────────────────────────────────────────
+    // ── Private: Pass 1 - Collect definitions ─────────────────────
 
     private getLanguageConfig(language: string): LanguageConfig | null {
         return LANGUAGE_CONFIGS[language] || null;
     }
 
-    private extractFromTree(
-        node: Parser.SyntaxNode,
-        source: string,
-        ctx: ExtractionContext,
-        config: LanguageConfig,
-    ): ExtractionResult {
-        const nodes: Omit<GraphNode, 'id'>[] = [];
-        const edges: Omit<GraphEdge, 'id'>[] = [];
-
-        // Track definitions for call resolution
-        const defNames = new Map<string, number>(); // name → temp index
-
-        // Recursively traverse the AST
-        this.traverseNode(node, source, ctx, config, nodes, edges, defNames);
-
-        return { nodes, edges };
-    }
-
-    private traverseNode(
+    private collectDefinitions(
         node: Parser.SyntaxNode,
         source: string,
         ctx: ExtractionContext,
         config: LanguageConfig,
         nodes: Omit<GraphNode, 'id'>[],
-        edges: Omit<GraphEdge, 'id'>[],
-        defNames: Map<string, number>,
+        registry: Map<string, NameEntry>,
+        parentName?: string,
     ): void {
-        // Check if this node is a definition
         const label = config.nodeTypes[node.type];
+
         if (label) {
-            const name = this.extractName(node, source, node.type);
+            const name = this.extractName(node, source, config);
             if (name) {
                 const startLine = node.startPosition.row + 1;
                 const endLine = node.endPosition.row + 1;
-                const qualifiedName = `${ctx.project}.${ctx.filePath.replace(/\//g, '.').replace(/\.[^.]+$/, '')}.${name}`;
+
+                // Build qualified name: include parent for nested definitions
+                let qualifiedName: string;
+                let displayName: string;
+                if (parentName && config.nestedDefTypes?.includes(node.type)) {
+                    displayName = `${parentName}.${name}`;
+                    qualifiedName = `${ctx.project}.${ctx.filePath.replace(/\//g, '.').replace(/\.[^.]+$/, '')}.${displayName}`;
+                } else {
+                    displayName = name;
+                    qualifiedName = `${ctx.project}.${ctx.filePath.replace(/\//g, '.').replace(/\.[^.]+$/, '')}.${name}`;
+                }
 
                 const nodeIndex = nodes.length;
-                defNames.set(name, nodeIndex);
-
                 nodes.push({
                     project: ctx.project,
                     label,
-                    name,
+                    name: displayName,
                     qualifiedName,
                     filePath: ctx.filePath,
                     startLine,
@@ -258,72 +293,278 @@ export class GraphExtractor {
                         nodeType: node.type,
                     },
                 });
+
+                // Register the name for call resolution
+                registry.set(name, { name, qualifiedName, nodeIndex });
+
+                // If this is a class/struct, recurse for nested methods
+                if (label === 'Class' || label === 'Struct' || label === 'Interface') {
+                    for (let i = 0; i < node.childCount; i++) {
+                        this.collectDefinitions(node.child(i)!, source, ctx, config, nodes, registry, name);
+                    }
+                    return; // Don't recurse again below
+                }
+            }
+        }
+
+        // Handle imports
+        if (config.importNodeTypes.includes(node.type)) {
+            this.collectImport(node, source, ctx, config, nodes, registry);
+        }
+
+        // Recurse into children (skip if already handled by class recursion)
+        if (!(label && (label === 'Class' || label === 'Struct' || label === 'Interface'))) {
+            for (let i = 0; i < node.childCount; i++) {
+                this.collectDefinitions(node.child(i)!, source, ctx, config, nodes, registry, parentName);
+            }
+        }
+    }
+
+    private collectImport(
+        node: Parser.SyntaxNode,
+        source: string,
+        _ctx: ExtractionContext,
+        config: LanguageConfig,
+        nodes: Omit<GraphNode, 'id'>[],
+        registry: Map<string, NameEntry>,
+    ): void {
+        // Extract imported names and their module paths
+        const imports = this.extractImportNames(node, source, config);
+        for (const imp of imports) {
+            // Register imported name so calls can resolve to it
+            const moduleQN = imp.modulePath;
+            if (!registry.has(imp.name)) {
+                // We don't have the target node yet, but we record the import reference
+                // The actual resolution happens at graph-build time (cross-file)
+                const nodeIndex = nodes.length;
+                nodes.push({
+                    project: _ctx.project,
+                    label: 'Module',
+                    name: imp.modulePath,
+                    qualifiedName: moduleQN,
+                    filePath: _ctx.filePath,
+                    startLine: node.startPosition.row + 1,
+                    endLine: node.endPosition.row + 1,
+                    properties: { importedName: imp.name, importPath: imp.modulePath },
+                });
+                registry.set(imp.name, {
+                    name: imp.name,
+                    qualifiedName: moduleQN,
+                    nodeIndex,
+                    importModule: moduleQN,
+                });
+            }
+        }
+    }
+
+    private extractImportNames(
+        node: Parser.SyntaxNode,
+        source: string,
+        config: LanguageConfig,
+    ): Array<{ name: string; modulePath: string }> {
+        const results: Array<{ name: string; modulePath: string }> = [];
+
+        // Extract the module path (string literal)
+        const modulePath = this.extractImportPath(node, source);
+
+        if (!modulePath) return results;
+
+        // For JS/TS: import { foo, bar } from './module'
+        const specifiers = this.findChildrenByType(node, 'import_specifier');
+        for (const spec of specifiers) {
+            const nameNode = this.findChildByType(spec, 'identifier');
+            if (nameNode) {
+                results.push({
+                    name: source.slice(nameNode.startIndex, nameNode.endIndex),
+                    modulePath,
+                });
+            }
+        }
+
+        // For JS/TS: import * as namespace from './module'
+        const namespace = this.findChildByType(node, 'namespace_import');
+        if (namespace) {
+            const nameNode = this.findChildByType(namespace, 'identifier');
+            if (nameNode) {
+                results.push({
+                    name: source.slice(nameNode.startIndex, nameNode.endIndex),
+                    modulePath,
+                });
+            }
+        }
+
+        // For Python: import foo, bar
+        if (modulePath && results.length === 0) {
+            const dottedNames = this.findChildrenByType(node, 'dotted_name');
+            for (const dn of dottedNames) {
+                const name = source.slice(dn.startIndex, dn.endIndex);
+                results.push({ name, modulePath: name });
+            }
+            // Python: from module import foo, bar
+            const aliasedImports = this.findChildrenByType(node, 'aliased_import');
+            for (const ai of aliasedImports) {
+                const nameNode = this.findChildByType(ai, 'identifier', 'dotted_name');
+                if (nameNode) {
+                    results.push({
+                        name: source.slice(nameNode.startIndex, nameNode.endIndex),
+                        modulePath: `${modulePath}.${source.slice(nameNode.startIndex, nameNode.endIndex)}`,
+                    });
+                }
+            }
+        }
+
+        // For Rust: use crate::foo::bar;
+        // For Java: import java.util.List;
+        if (results.length === 0 && modulePath) {
+            const parts = modulePath.split(/[.:]/);
+            const lastName = parts[parts.length - 1];
+            if (lastName) {
+                results.push({ name: lastName, modulePath });
+            }
+        }
+
+        return results;
+    }
+
+    // ── Private: Pass 2 - Resolve calls ───────────────────────────
+
+    private resolveCalls(
+        node: Parser.SyntaxNode,
+        source: string,
+        ctx: ExtractionContext,
+        config: LanguageConfig,
+        nodes: Omit<GraphNode, 'id'>[],
+        registry: Map<string, NameEntry>,
+        edges: Omit<GraphEdge, 'id'>[],
+        parentDefIdx?: number,
+    ): void {
+        const label = config.nodeTypes[node.type];
+
+        // Track current parent definition for scoping calls
+        let currentDefIdx: number | undefined = parentDefIdx;
+
+        if (label) {
+            const name = this.extractName(node, source, config);
+            if (name) {
+                const entry = registry.get(name);
+                if (entry) {
+                    currentDefIdx = entry.nodeIndex;
+                }
             }
         }
 
         // Check if this is a call expression
-        if (config.callNodeTypes.includes(node.type)) {
-            const callName = this.extractCallName(node, source);
-            if (callName && defNames.has(callName)) {
-                const targetIdx = defNames.get(callName)!;
-                // We'll resolve edges after all nodes are collected
+        if (config.callNodeTypes.includes(node.type) && currentDefIdx !== undefined) {
+            const callName = this.extractCallName(node, source, config);
+            if (callName) {
+                const entry = registry.get(callName);
+                if (entry && entry.nodeIndex !== currentDefIdx) {
+                    // Don't create self-referencing edges
+                    edges.push({
+                        project: ctx.project,
+                        sourceId: currentDefIdx, // temp index, will be resolved
+                        targetId: entry.nodeIndex,
+                        type: entry.importModule ? 'IMPORTS' : 'CALLS',
+                        properties: {
+                            line: node.startPosition.row + 1,
+                            importModule: entry.importModule,
+                        },
+                    });
+                }
             }
-        }
 
-        // Check for imports
-        if (config.importNodeTypes.includes(node.type)) {
-            const importPath = this.extractImportPath(node, source, ctx.language);
-            if (importPath) {
-                const moduleQN = `${ctx.project}.${this.normalizeImportPath(importPath, ctx.filePath)}`;
-                const moduleName = importPath.split('/').pop() || importPath;
-                const nodeIndex = nodes.length;
-                nodes.push({
-                    project: ctx.project,
-                    label: 'Module',
-                    name: moduleName,
-                    qualifiedName: moduleQN,
-                    filePath: ctx.filePath,
-                    startLine: node.startPosition.row + 1,
-                    endLine: node.endPosition.row + 1,
-                    properties: { importPath },
-                });
+            // Handle method calls (obj.method())
+            const methodCall = this.extractMethodCall(node, source, config);
+            if (methodCall && currentDefIdx !== undefined) {
+                const entry = registry.get(methodCall);
+                if (entry && entry.nodeIndex !== currentDefIdx) {
+                    edges.push({
+                        project: ctx.project,
+                        sourceId: currentDefIdx,
+                        targetId: entry.nodeIndex,
+                        type: 'CALLS',
+                        properties: {
+                            line: node.startPosition.row + 1,
+                            callType: 'method',
+                        },
+                    });
+                }
             }
         }
 
         // Recurse into children
         for (let i = 0; i < node.childCount; i++) {
-            this.traverseNode(node.child(i)!, source, ctx, config, nodes, edges, defNames);
+            this.resolveCalls(node.child(i)!, source, ctx, config, nodes, registry, edges, currentDefIdx);
         }
     }
 
-    private extractName(node: Parser.SyntaxNode, source: string, nodeType: string): string | null {
-        // Find the name/identifier child node
-        const nameChild = node.childForFieldName?.('name')
-            ?? this.findChildByType(node, 'identifier', 'property_identifier', 'type_identifier');
+    // ── Private: Name extraction helpers ───────────────────────────
+
+    private extractName(node: Parser.SyntaxNode, source: string, config: LanguageConfig): string | null {
+        // Try named fields first
+        if (config.nameFields) {
+            for (const field of config.nameFields) {
+                const child = node.childForFieldName?.(field);
+                if (child) {
+                    return source.slice(child.startIndex, child.endIndex);
+                }
+            }
+        }
+        // Fallback: find identifier child
+        const nameChild = this.findChildByType(node, 'identifier', 'property_identifier', 'type_identifier');
         if (nameChild) {
             return source.slice(nameChild.startIndex, nameChild.endIndex);
         }
         return null;
     }
 
-    private extractCallName(node: Parser.SyntaxNode, source: string): string | null {
-        const funcChild = node.childForFieldName?.('function')
-            ?? this.findChildByType(node, 'identifier', 'member_expression');
+    private extractCallName(node: Parser.SyntaxNode, source: string, config: LanguageConfig): string | null {
+        // Try 'function' field first
+        const funcChild = node.childForFieldName?.('function');
         if (funcChild) {
-            return source.slice(funcChild.startIndex, funcChild.endIndex);
+            // For simple calls: just the identifier
+            if (funcChild.type === 'identifier') {
+                return source.slice(funcChild.startIndex, funcChild.endIndex);
+            }
+            // For member expressions: obj.method
+            const id = this.findChildByType(funcChild, 'identifier');
+            if (id) {
+                return source.slice(id.startIndex, id.endIndex);
+            }
+        }
+
+        // Fallback: first identifier child
+        const id = this.findChildByType(node, 'identifier');
+        if (id) {
+            return source.slice(id.startIndex, id.endIndex);
+        }
+
+        return null;
+    }
+
+    private extractMethodCall(node: Parser.SyntaxNode, source: string, config: LanguageConfig): string | null {
+        // Look for member_expression where the call is on a method
+        const funcChild = node.childForFieldName?.('function');
+        if (funcChild && funcChild.type === 'member_expression') {
+            const property = funcChild.childForFieldName?.('property');
+            if (property) {
+                return source.slice(property.startIndex, property.endIndex);
+            }
         }
         return null;
     }
 
-    private extractImportPath(node: Parser.SyntaxNode, source: string, language: string): string | null {
+    private extractImportPath(node: Parser.SyntaxNode, source: string): string | null {
         // Find the string literal containing the import path
-        const stringChild = this.findChildByType(node, 'string', 'string_fragment');
+        const stringChild = this.findChildByType(node, 'string', 'string_fragment', 'string_literal');
         if (stringChild) {
             const raw = source.slice(stringChild.startIndex, stringChild.endIndex);
             return raw.replace(/^['"]|['"]$/g, '');
         }
         return null;
     }
+
+    // ── Private: AST navigation helpers ────────────────────────────
 
     private findChildByType(node: Parser.SyntaxNode, ...types: string[]): Parser.SyntaxNode | null {
         for (let i = 0; i < node.childCount; i++) {
@@ -337,11 +578,15 @@ export class GraphExtractor {
         return null;
     }
 
-    private normalizeImportPath(importPath: string, currentFile: string): string {
-        if (importPath.startsWith('.')) {
-            const dir = currentFile.substring(0, currentFile.lastIndexOf('/'));
-            return (dir ? dir + '/' : '') + importPath.replace(/^\.\//, '');
+    private findChildrenByType(node: Parser.SyntaxNode, type: string): Parser.SyntaxNode[] {
+        const results: Parser.SyntaxNode[] = [];
+        for (let i = 0; i < node.childCount; i++) {
+            const child = node.child(i)!;
+            if (child.type === type) {
+                results.push(child);
+            }
+            results.push(...this.findChildrenByType(child, type));
         }
-        return importPath;
+        return results;
     }
 }

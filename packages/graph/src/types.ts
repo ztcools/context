@@ -62,7 +62,7 @@ export interface GraphEdge {
 // ── Search types ──────────────────────────────────────────────────
 
 export interface GraphSearchOptions {
-    project: string;
+    project?: string;
     query?: string;           // BM25 full-text search
     label?: GraphNodeLabel;
     namePattern?: string;     // Regex pattern on name

@@ -84,13 +84,26 @@ export class GraphToolHandlers {
                     language: lang,
                 });
 
+                // Insert nodes and build temp-index → real-ID mapping
+                const idMap = new Map<number, number>();
                 for (const node of result.nodes) {
-                    this.store.upsertNode(node);
-                    nodeCount++;
+                    const realId = this.store.upsertNode(node);
+                    idMap.set(nodeCount + idMap.size, realId);
                 }
+                nodeCount += result.nodes.length;
+
+                // Resolve edges with real IDs
                 for (const edge of result.edges) {
-                    this.store.upsertEdge(edge);
-                    edgeCount++;
+                    const sourceId = idMap.get(edge.sourceId);
+                    const targetId = idMap.get(edge.targetId);
+                    if (sourceId !== undefined && targetId !== undefined) {
+                        this.store.upsertEdge({
+                            ...edge,
+                            sourceId,
+                            targetId,
+                        });
+                        edgeCount++;
+                    }
                 }
             }
 
@@ -360,19 +373,82 @@ export class GraphToolHandlers {
 
     handleDetectChanges(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
         const project = args.project as string;
+        const baseBranch = (args.base_branch as string) || 'main';
+
         if (!project) {
             return { content: [{ type: 'text', text: 'Error: "project" is required.' }] };
         }
 
         const lines: string[] = [];
         lines.push(`Change detection for project '${project}':`);
-        lines.push('Note: Full git diff analysis requires the repository to be available locally.');
-        lines.push('Currently showing graph statistics as baseline.');
         lines.push('');
 
-        const stats = this.store.getProjectStats(project);
-        lines.push(`Current state: ${stats.nodes} nodes, ${stats.edges} edges`);
-        lines.push('Use index_repository to update the graph after changes.');
+        try {
+            // Find the repo path by looking up the project in the graph
+            const nodes = this.store.findNodes({ project, limit: 1 });
+            if (nodes.results.length === 0) {
+                return { content: [{ type: 'text', text: `Project '${project}' not found in graph index.` }] };
+            }
+
+            // Try to find the repo on disk
+            const repoPath = this.findRepoPath(project);
+            if (!repoPath) {
+                lines.push('Repository not found on disk. Use index_repository to re-index.');
+                return { content: [{ type: 'text', text: lines.join('\n') }] };
+            }
+
+            // Run git diff to find changed files
+            const { execSync } = require('child_process');
+            let diffOutput: string;
+            try {
+                diffOutput = execSync(`git diff --name-only ${baseBranch}...HEAD`, {
+                    cwd: repoPath,
+                    encoding: 'utf-8',
+                    timeout: 10000,
+                });
+            } catch {
+                // Try diff against working tree
+                diffOutput = execSync('git diff --name-only HEAD', {
+                    cwd: repoPath,
+                    encoding: 'utf-8',
+                    timeout: 10000,
+                });
+            }
+
+            const changedFiles = diffOutput.trim().split('\n').filter(Boolean);
+
+            if (changedFiles.length === 0) {
+                lines.push('No changes detected.');
+                return { content: [{ type: 'text', text: lines.join('\n') }] };
+            }
+
+            lines.push(`Changed files: ${changedFiles.length}`);
+            for (const file of changedFiles) {
+                lines.push(`  ${file}`);
+            }
+            lines.push('');
+
+            // Find impacted nodes
+            const result = this.store.findNodes({
+                project,
+                filePattern: changedFiles.map(f => this.escapeRegex(f)).join('|'),
+                limit: 1000,
+            });
+
+            if (result.results.length > 0) {
+                lines.push(`Impacted graph nodes: ${result.results.length}`);
+                for (const r of result.results) {
+                    lines.push(`  ${r.node.label} ${r.node.name} (${r.node.filePath}:${r.node.startLine})`);
+                }
+            } else {
+                lines.push('No graph nodes directly impacted by changes.');
+            }
+
+            lines.push('');
+            lines.push('Use index_repository with the changed files to update the graph.');
+        } catch (error: any) {
+            lines.push(`Error: ${error.message}`);
+        }
 
         return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -429,6 +505,88 @@ export class GraphToolHandlers {
         return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
+    // ── Tool: query_graph ────────────────────────────────────────
+
+    handleQueryGraph(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
+        const project = args.project as string;
+        const query = args.query as string;
+
+        if (!project || !query) {
+            return { content: [{ type: 'text', text: 'Error: "project" and "query" are required.' }] };
+        }
+
+        try {
+            const result = this.store.executeQuery(project, query);
+            const lines: string[] = [];
+
+            if (result.rows.length === 0) {
+                lines.push('Query returned no results.');
+            } else {
+                lines.push(`Query results (${result.rows.length} rows):`);
+                for (const row of result.rows) {
+                    lines.push(`  ${JSON.stringify(row)}`);
+                }
+            }
+
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
+        } catch (error: any) {
+            return { content: [{ type: 'text', text: `Query error: ${error.message}` }] };
+        }
+    }
+
+    // ── Tool: manage_adr ─────────────────────────────────────────
+
+    handleManageAdr(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
+        const action = (args.action as string) || 'list';
+        const project = args.project as string;
+        const title = args.title as string;
+        const content = args.content as string;
+
+        const lines: string[] = [];
+
+        switch (action) {
+            case 'list': {
+                const adrs = this.store.getADRs(project);
+                if (adrs.length === 0) {
+                    lines.push(project ? `No ADRs for project '${project}'.` : 'No ADRs found.');
+                } else {
+                    lines.push(`ADRs (${adrs.length}):`);
+                    for (const adr of adrs) {
+                        lines.push(`  [${adr.id}] ${adr.title} (${adr.status}, ${adr.created})`);
+                    }
+                }
+                break;
+            }
+            case 'create': {
+                if (!project || !title) {
+                    return { content: [{ type: 'text', text: 'Error: "project" and "title" are required for create.' }] };
+                }
+                const id = this.store.createADR({
+                    project,
+                    title,
+                    content: content || '',
+                    status: 'proposed',
+                });
+                lines.push(`ADR created: id=${id}, title="${title}"`);
+                break;
+            }
+            case 'update': {
+                const adrId = args.id as number;
+                const status = args.status as string;
+                if (!adrId) {
+                    return { content: [{ type: 'text', text: 'Error: "id" is required for update.' }] };
+                }
+                this.store.updateADR(adrId, { status, content });
+                lines.push(`ADR ${adrId} updated.`);
+                break;
+            }
+            default:
+                return { content: [{ type: 'text', text: `Unknown action: ${action}. Use "list", "create", or "update".` }] };
+        }
+
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
 
     private langToExts(lang: string): string[] {
@@ -443,6 +601,41 @@ export class GraphToolHandlers {
             csharp: ['.cs'],
         };
         return map[lang] || [];
+    }
+
+    private findRepoPath(project: string): string | null {
+        // Try to find the repo on disk by scanning common locations
+        const searchPaths = [
+            process.cwd(),
+            path.join(process.env.HOME || '/home', 'deploy'),
+            '/home/zt',
+        ];
+
+        for (const searchPath of searchPaths) {
+            try {
+                if (!fs.existsSync(searchPath)) continue;
+                const entries = fs.readdirSync(searchPath, { withFileTypes: true });
+                for (const entry of entries) {
+                    if (!entry.isDirectory()) continue;
+                    const fullPath = path.join(searchPath, entry.name);
+                    const gitDir = path.join(fullPath, '.git');
+                    if (!fs.existsSync(gitDir)) continue;
+
+                    // Check if this repo's identity matches the project
+                    const identity = getRepoIdentity(fullPath);
+                    if (identity === project) {
+                        return fullPath;
+                    }
+                }
+            } catch {
+                // Skip
+            }
+        }
+        return null;
+    }
+
+    private escapeRegex(str: string): string {
+        return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
     private scanFiles(dir: string, extensions: string[]): string[] {

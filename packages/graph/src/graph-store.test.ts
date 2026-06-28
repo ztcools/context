@@ -25,10 +25,10 @@ describe('SqliteGraphStore', () => {
 
     after(() => {
         store.close();
-        try { fs.unlinkSync(TEST_DB); } catch {}
+        try { fs.unlinkSync(TEST_DB); } catch { }
         // Clean up WAL/SHM files
-        try { fs.unlinkSync(TEST_DB + '-wal'); } catch {}
-        try { fs.unlinkSync(TEST_DB + '-shm'); } catch {}
+        try { fs.unlinkSync(TEST_DB + '-wal'); } catch { }
+        try { fs.unlinkSync(TEST_DB + '-shm'); } catch { }
     });
 
     it('should initialize with empty state', () => {
@@ -185,6 +185,51 @@ class MyClass {
         assert.ok(functions.length >= 1);
     });
 
+    it('should create CALLS edges between functions', () => {
+        const extractor = new GraphExtractor();
+        const source = `
+function foo() {
+    bar();
+}
+
+function bar() {
+    console.log("bar");
+}
+
+function baz() {
+    foo();
+    bar();
+}
+`;
+        const result = extractor.extract(source, {
+            project: 'test',
+            filePath: 'src/calls.ts',
+            language: 'typescript',
+        });
+
+        const callEdges = result.edges.filter(e => e.type === 'CALLS');
+        assert.ok(callEdges.length >= 2, `Expected at least 2 CALLS edges, got ${callEdges.length}`);
+    });
+
+    it('should handle import resolution', () => {
+        const extractor = new GraphExtractor();
+        const source = `
+import { helper } from './utils';
+
+function main() {
+    helper();
+}
+`;
+        const result = extractor.extract(source, {
+            project: 'test',
+            filePath: 'src/main.ts',
+            language: 'typescript',
+        });
+
+        const importEdges = result.edges.filter(e => e.type === 'IMPORTS');
+        assert.ok(importEdges.length >= 1, `Expected at least 1 IMPORTS edge, got ${importEdges.length}`);
+    });
+
     it('should extract functions from Python code', () => {
         const extractor = new GraphExtractor();
         const source = `
@@ -327,6 +372,54 @@ describe('ArchitectureAnalyzer', () => {
         assert.ok(arch.nodeTypes['Function'] >= 1);
         assert.ok(arch.nodeTypes['Class'] >= 1);
         assert.ok(arch.clusters.length >= 1);
+    });
+});
+
+describe('ADR and QueryGraph', () => {
+    let store: SqliteGraphStore;
+
+    before(() => {
+        store = new SqliteGraphStore(TEST_DB + '-adr');
+        store.initialize();
+        store.upsertNode({ project: 'p', label: 'Function', name: 'testFunc', qualifiedName: 'p.testFunc', filePath: 'src/test.ts', startLine: 1, endLine: 5, properties: {} });
+    });
+
+    after(() => {
+        store.close();
+    });
+
+    it('should create and list ADRs', () => {
+        const id = store.createADR({
+            project: 'p',
+            title: 'Use PostgreSQL for storage',
+            content: 'Decision: Use PostgreSQL as the primary database.',
+            status: 'proposed',
+        });
+        assert.ok(id > 0);
+
+        const adrs = store.getADRs('p');
+        assert.strictEqual(adrs.length, 1);
+        assert.strictEqual(adrs[0].title, 'Use PostgreSQL for storage');
+        assert.strictEqual(adrs[0].status, 'proposed');
+    });
+
+    it('should update ADR status', () => {
+        const adrs = store.getADRs('p');
+        store.updateADR(adrs[0].id, { status: 'accepted' });
+
+        const updated = store.getADRs('p');
+        assert.strictEqual(updated[0].status, 'accepted');
+    });
+
+    it('should execute Cypher-like query', () => {
+        const result = store.executeQuery('p', "MATCH (n) WHERE n.name = 'testFunc' RETURN n");
+        assert.strictEqual(result.rows.length, 1);
+        assert.strictEqual(result.rows[0].name, 'testFunc');
+    });
+
+    it('should execute query with CONTAINS', () => {
+        const result = store.executeQuery('p', "MATCH (n) WHERE n.name CONTAINS 'test' RETURN n");
+        assert.ok(result.rows.length >= 1);
     });
 });
 

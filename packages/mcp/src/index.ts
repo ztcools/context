@@ -378,6 +378,34 @@ This tool is versatile and can be used before completing various tasks to retrie
                             required: ["project"]
                         }
                     },
+                    {
+                        name: "query_graph",
+                        description: `Execute a Cypher-like query on the knowledge graph. Supports: MATCH (n) WHERE n.name = 'X' RETURN n`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" },
+                                query: { type: "string", description: "Cypher-like query: MATCH (n) WHERE n.name = 'X' RETURN n" }
+                            },
+                            required: ["project", "query"]
+                        }
+                    },
+                    {
+                        name: "manage_adr",
+                        description: `Manage Architecture Decision Records (ADRs). Actions: list, create, update.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                action: { type: "string", enum: ["list", "create", "update"], default: "list" },
+                                project: { type: "string", description: "Project identifier" },
+                                title: { type: "string", description: "ADR title (for create)" },
+                                content: { type: "string", description: "ADR content (for create/update)" },
+                                id: { type: "integer", description: "ADR id (for update)" },
+                                status: { type: "string", enum: ["proposed", "accepted", "deprecated", "superseded"], description: "ADR status" }
+                            },
+                            required: ["action"]
+                        }
+                    },
                 ]
             };
         });
@@ -420,6 +448,10 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return this.graphToolHandlers.handleIndexStatus(safeArgs);
                 case "detect_changes":
                     return this.graphToolHandlers.handleDetectChanges(safeArgs);
+                case "query_graph":
+                    return this.graphToolHandlers.handleQueryGraph(safeArgs);
+                case "manage_adr":
+                    return this.graphToolHandlers.handleManageAdr(safeArgs);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);
