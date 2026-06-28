@@ -258,7 +258,7 @@ export class GraphExtractor {
      */
     static extToLanguage(ext: string): string {
         const map: Record<string, string> = {
-            '.js': 'javascript', '.jsx': 'javascript',
+            '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript',
             '.ts': 'typescript', '.tsx': 'typescript',
             '.py': 'python',
             '.java': 'java',
