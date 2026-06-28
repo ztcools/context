@@ -31,6 +31,14 @@ const MAX_CROSS_FILE_NODES = 200000;
 // Max rows to return from query_graph
 const QUERY_GRAPH_MAX_ROWS = 1000;
 
+// Shared directory ignore set for both code and IaC file scanning
+const IGNORE_DIRS = new Set([
+    'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
+    '.venv', 'vendor', 'target', 'coverage', '.cache', '.idea', '.vscode',
+    '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp', '.tox',
+    '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
+]);
+
 export class GraphToolHandlers {
     private store: SqliteGraphStore;
     private extractor: GraphExtractor;
@@ -811,11 +819,7 @@ export class GraphToolHandlers {
             nodeIds.add(edge.sourceId);
             nodeIds.add(edge.targetId);
         }
-        const nodeMap = new Map<number, GraphNode>();
-        for (const id of nodeIds) {
-            const node = this.store.getNodeById(id);
-            if (node) nodeMap.set(id, node);
-        }
+        const nodeMap = this.store.getNodesById(Array.from(nodeIds));
 
         for (const edge of importEdges) {
             const sourceNode = nodeMap.get(edge.sourceId);
@@ -937,19 +941,13 @@ export class GraphToolHandlers {
     private scanFiles(dir: string, extensions: string[]): string[] {
         const results: string[] = [];
         const extSet = new Set(extensions);
-        const ignoreSet = new Set([
-            'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
-            '.venv', 'vendor', 'target', 'coverage', '.cache', '.idea', '.vscode',
-            '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp', '.tox',
-            '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
-        ]);
 
         const stack: string[] = [dir];
         while (stack.length > 0) {
             const current = stack.pop()!;
             const entries = fs.readdirSync(current, { withFileTypes: true });
             for (const entry of entries) {
-                if (ignoreSet.has(entry.name)) continue;
+                if (IGNORE_DIRS.has(entry.name)) continue;
                 const fullPath = path.join(current, entry.name);
                 if (entry.isDirectory()) {
                     stack.push(fullPath);
@@ -967,17 +965,13 @@ export class GraphToolHandlers {
      */
     private scanIaCFiles(dir: string): string[] {
         const results: string[] = [];
-        const ignoreSet = new Set([
-            'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
-            '.venv', 'vendor', 'target', 'coverage', '.cache', '.idea', '.vscode',
-        ]);
 
         const stack: string[] = [dir];
         while (stack.length > 0) {
             const current = stack.pop()!;
             const entries = fs.readdirSync(current, { withFileTypes: true });
             for (const entry of entries) {
-                if (ignoreSet.has(entry.name)) continue;
+                if (IGNORE_DIRS.has(entry.name)) continue;
                 const fullPath = path.join(current, entry.name);
                 if (entry.isDirectory()) {
                     stack.push(fullPath);

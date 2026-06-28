@@ -143,6 +143,22 @@ export class SqliteGraphStore implements GraphStore {
         return row ? this.rowToNode(row) : null;
     }
 
+    getNodesById(ids: number[]): Map<number, GraphNode> {
+        const result = new Map<number, GraphNode>();
+        if (ids.length === 0) return result;
+
+        const placeholders = ids.map(() => '?').join(',');
+        const rows = this.db.prepare(
+            `SELECT * FROM nodes WHERE id IN (${placeholders})`
+        ).all(...ids) as Array<Record<string, unknown>>;
+
+        for (const row of rows) {
+            const node = this.rowToNode(row);
+            result.set(node.id, node);
+        }
+        return result;
+    }
+
     getNodeByQN(project: string, qualifiedName: string): GraphNode | null {
         const row = this.db.prepare(
             'SELECT * FROM nodes WHERE project = ? AND qualified_name = ?'
@@ -355,6 +371,25 @@ export class SqliteGraphStore implements GraphStore {
         }
         const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
         return rows.map(r => this.rowToEdge(r));
+    }
+
+    getEdgesBySourceBatch(sourceIds: number[]): Map<number, GraphEdge[]> {
+        const resultMap = new Map<number, GraphEdge[]>();
+        if (sourceIds.length === 0) return resultMap;
+
+        for (const id of sourceIds) resultMap.set(id, []);
+
+        const placeholders = sourceIds.map(() => '?').join(',');
+        const rows = this.db.prepare(
+            `SELECT * FROM edges WHERE source_id IN (${placeholders})`
+        ).all(...sourceIds) as Array<Record<string, unknown>>;
+
+        for (const row of rows) {
+            const edge = this.rowToEdge(row);
+            const list = resultMap.get(edge.sourceId);
+            if (list) list.push(edge);
+        }
+        return resultMap;
     }
 
     getEdgesByTarget(targetId: number, type?: GraphEdgeType): GraphEdge[] {

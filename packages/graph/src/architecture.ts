@@ -80,11 +80,14 @@ export class ArchitectureAnalyzer {
     private findEntryPoints(nodes: GraphNode[]): GraphNode[] {
         const candidates: Array<{ node: GraphNode; score: number }> = [];
 
-        for (const node of nodes) {
-            if (node.label !== 'Function' && node.label !== 'Method') continue;
+        // Filter to Function/Method nodes first
+        const funcNodes = nodes.filter(n => n.label === 'Function' || n.label === 'Method');
 
-            const { inDegree, outDegree } = this.store.getNodeDegree(node.id);
-            // Entry points: high out-degree relative to in-degree (they call others, few call them)
+        // Batch-load degrees for all candidate nodes to avoid N+1 queries
+        const degreeMap = this.store.getNodeDegreesBatch(funcNodes.map(n => n.id));
+
+        for (const node of funcNodes) {
+            const { inDegree, outDegree } = degreeMap.get(node.id) || { inDegree: 0, outDegree: 0 };
             const score = outDegree - inDegree * 2;
             if (score > 0) {
                 candidates.push({ node, score });
@@ -144,9 +147,13 @@ export class ArchitectureAnalyzer {
         for (const [dir, dirNodes] of dirGroups) {
             if (dirNodes.length < 2) continue; // Skip single-node directories
 
+            // Batch-load edges for all nodes in this cluster to avoid N+1 queries
+            const nodeIds = dirNodes.map(n => n.id);
+            const edgesBatch = this.store.getEdgesBySourceBatch(nodeIds);
+
             const edgeTypes = new Set<GraphEdgeType>();
             for (const node of dirNodes) {
-                const outEdges = this.store.getEdgesBySource(node.id);
+                const outEdges = edgesBatch.get(node.id) || [];
                 for (const e of outEdges) {
                     edgeTypes.add(e.type);
                 }

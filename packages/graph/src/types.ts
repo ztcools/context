@@ -157,13 +157,16 @@ export interface GraphStore {
     // Node operations
     upsertNode(node: Omit<GraphNode, 'id'>): number;
     getNodeById(id: number): GraphNode | null;
+    getNodesById(ids: number[]): Map<number, GraphNode>;
     getNodeByQN(project: string, qualifiedName: string): GraphNode | null;
     findNodes(options: GraphSearchOptions): GraphSearchResponse;
     getNodeDegree(nodeId: number): { inDegree: number; outDegree: number };
+    getNodeDegreesBatch(nodeIds: number[]): Map<number, { inDegree: number; outDegree: number }>;
 
     // Edge operations
     upsertEdge(edge: Omit<GraphEdge, 'id'>): number;
     getEdgesBySource(sourceId: number, type?: GraphEdgeType): GraphEdge[];
+    getEdgesBySourceBatch(sourceIds: number[]): Map<number, GraphEdge[]>;
     getEdgesByTarget(targetId: number, type?: GraphEdgeType): GraphEdge[];
     findEdges(project: string, types?: GraphEdgeType[], limit?: number): GraphEdge[];
 
