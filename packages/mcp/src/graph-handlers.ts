@@ -833,6 +833,8 @@ export class GraphToolHandlers {
     }
 
     private langToExts(lang: string): string[] {
+        // Only includes languages supported by GraphExtractor (LANGUAGE_CONFIGS).
+        // Adding a language here without adding a parser to extractor.ts is dead code.
         const map: Record<string, string[]> = {
             javascript: ['.js', '.jsx', '.mjs'],
             typescript: ['.ts', '.tsx'],
@@ -842,14 +844,6 @@ export class GraphToolHandlers {
             go: ['.go'],
             rust: ['.rs'],
             csharp: ['.cs'],
-            ruby: ['.rb'],
-            php: ['.php'],
-            scala: ['.scala'],
-            swift: ['.swift'],
-            kotlin: ['.kt', '.kts'],
-            dart: ['.dart'],
-            lua: ['.lua'],
-            zig: ['.zig'],
         };
         return map[lang] || [];
     }
