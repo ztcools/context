@@ -190,7 +190,9 @@ export class GraphSearcher {
                     matchContent: match.content,
                 });
             } else if (results.length < limit) {
-                // Fallback: create a file-level pseudo-node
+                // Pseudo-node for file-level matches without a known containing node.
+                // id: -1 signals this is not a real graph node — must not be passed to
+                // graph operations like getNodeDegree() or trace_path().
                 results.push({
                     node: {
                         id: -1,

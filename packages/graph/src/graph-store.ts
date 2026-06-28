@@ -473,9 +473,8 @@ export class SqliteGraphStore implements GraphStore {
             }
         }
 
-        // Fallback: execute as raw SQL (with project filter)
-        const rows = this.db.prepare(query).all() as Array<Record<string, unknown>>;
-        return { rows };
+        // Fallback: reject raw SQL for security. Only parameterized Cypher queries are supported.
+        throw new Error(`Unsupported query format. Use Cypher-like syntax: MATCH (n) WHERE n.name = 'X' RETURN n`);
     }
 
     // ── ADR (Architecture Decision Records) ──────────────────────

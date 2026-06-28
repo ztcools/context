@@ -23,6 +23,9 @@ import {
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
 
+// Max nodes to load for cross-file call resolution
+const MAX_CROSS_FILE_NODES = 200000;
+
 export class GraphToolHandlers {
     private store: SqliteGraphStore;
     private extractor: GraphExtractor;
@@ -696,7 +699,7 @@ export class GraphToolHandlers {
         let count = 0;
 
         // 1. Build global function registry: name → qualifiedName → nodeId
-        const allNodes = this.store.findNodes({ project, limit: 100000 });
+        const allNodes = this.store.findNodes({ project, limit: MAX_CROSS_FILE_NODES });
         const globalRegistry = new Map<string, Array<{ qualifiedName: string; nodeId: number; filePath: string }>>();
 
         for (const result of allNodes.results) {
@@ -714,7 +717,7 @@ export class GraphToolHandlers {
         }
 
         // 2. Find all IMPORTS edges
-        const importEdges = this.store.findEdges(project, ['IMPORTS'], 100000);
+        const importEdges = this.store.findEdges(project, ['IMPORTS'], MAX_CROSS_FILE_NODES);
 
         for (const edge of importEdges) {
             const sourceNode = this.store.getNodeById(edge.sourceId);
@@ -748,8 +751,8 @@ export class GraphToolHandlers {
                         },
                     });
                     count++;
-                } catch {
-                    // Skip duplicate or invalid edges
+                } catch (err: any) {
+                    console.warn(`[Graph] Failed to create cross-file CALLS edge: ${sourceNode.name} → ${candidate.qualifiedName}: ${err.message}`);
                 }
             }
         }
@@ -774,10 +777,11 @@ export class GraphToolHandlers {
 
     private findRepoPath(project: string): string | null {
         // Try to find the repo on disk by scanning common locations
+        const homeDir = os.homedir();
         const searchPaths = [
             process.cwd(),
-            path.join(process.env.HOME || '/home', 'deploy'),
-            '/home/zt',
+            path.join(homeDir, 'deploy'),
+            homeDir,
         ];
 
         for (const searchPath of searchPaths) {
