@@ -161,23 +161,30 @@ export class GraphSearcher {
         const results: SearchCodeResult[] = [];
         const seenNodes = new Set<number>();
 
-        for (const match of matches) {
-            // Find containing function/class for this match
+        // Batch-load all nodes for all unique file paths to avoid N+1 queries
+        const uniqueFiles = [...new Set(matches.map(m => m.filePath))];
+        const fileNodes = new Map<string, GraphNode[]>();
+        for (const filePath of uniqueFiles) {
             const nodeResult = this.store.findNodes({
                 project,
-                filePattern: escapeRegex(match.filePath),
-                limit: 100,
+                filePattern: escapeRegex(filePath),
+                limit: 500,
             });
+            fileNodes.set(filePath, nodeResult.results.map(r => r.node));
+        }
+
+        for (const match of matches) {
+            const nodes = fileNodes.get(match.filePath) || [];
 
             // Find the smallest node that contains this line
             let containingNode: GraphNode | null = null;
             let minSize = Infinity;
 
-            for (const r of nodeResult.results) {
-                if (r.node.startLine <= match.line && r.node.endLine >= match.line) {
-                    const size = r.node.endLine - r.node.startLine;
-                    if (size < minSize && !seenNodes.has(r.node.id)) {
-                        containingNode = r.node;
+            for (const node of nodes) {
+                if (node.startLine <= match.line && node.endLine >= match.line) {
+                    const size = node.endLine - node.startLine;
+                    if (size < minSize && !seenNodes.has(node.id)) {
+                        containingNode = node;
                         minSize = size;
                     }
                 }

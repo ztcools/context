@@ -63,6 +63,7 @@ export class SyncManager {
     private syncLockToken: string | null = null;
     private triggerWatcher: fs.FSWatcher | null = null;
     private triggerDebounceTimer: NodeJS.Timeout | null = null;
+    private syncInterval: NodeJS.Timeout | null = null;
 
     constructor(context: Context, snapshotManager: SnapshotManager) {
         this.context = context;
@@ -310,14 +311,25 @@ export class SyncManager {
 
         // Periodically check for file changes and update the index
         console.log(`[SYNC-DEBUG] Setting up periodic sync every ${syncIntervalMs}ms`);
-        const syncInterval = setInterval(() => {
+        this.syncInterval = setInterval(() => {
             console.log('[SYNC-DEBUG] Executing scheduled periodic sync');
             this.handleSyncIndex().catch(err => {
                 console.error('[SYNC-DEBUG] Unhandled error in periodic sync:', err);
             });
         }, syncIntervalMs);
 
-        console.log('[SYNC-DEBUG] Background sync setup complete. Interval ID:', syncInterval);
+        console.log('[SYNC-DEBUG] Background sync setup complete. Interval ID:', this.syncInterval);
+    }
+
+    /**
+     * Stop the background sync interval. Safe to call multiple times.
+     */
+    public stopBackgroundSync(): void {
+        if (this.syncInterval) {
+            clearInterval(this.syncInterval);
+            this.syncInterval = null;
+            console.log('[SYNC-DEBUG] Background sync stopped.');
+        }
     }
 
     /**

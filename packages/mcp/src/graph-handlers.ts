@@ -90,6 +90,12 @@ export class GraphToolHandlers {
             let nodeCount = 0;
             let edgeCount = 0;
 
+            // Full mode: clear old project data before re-indexing
+            if (mode === 'full') {
+                this.store.deleteProject(project);
+                console.log(`[GraphIndex] Cleared existing graph data for '${project}'`);
+            }
+
             this.store.beginTransaction();
 
             for (const filePath of files) {
