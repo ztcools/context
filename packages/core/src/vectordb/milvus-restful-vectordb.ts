@@ -877,9 +877,14 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                 console.warn(`[MilvusRestfulDB] Collection limit exceeded`);
                 return false;
             }
-            console.warn(`[MilvusRestfulDB] Collection limit check failed: ${errorMessage}`);
-            // If the check itself fails for other reasons, allow creation to proceed
-            return true;
+            // Distinguish between transient (allow) and fatal (refuse) errors
+            const isTransient = /ECONNREFUSED|ETIMEDOUT|5\d{2}|429/i.test(errorMessage);
+            if (isTransient) {
+                console.warn(`[MilvusRestfulDB] Collection limit check failed (transient): ${errorMessage}`);
+                return true; // Allow creation to proceed on transient errors
+            }
+            console.error(`[MilvusRestfulDB] Collection limit check failed (fatal): ${errorMessage}`);
+            return false; // Refuse creation on fatal errors (auth, config, etc.)
         }
     }
 

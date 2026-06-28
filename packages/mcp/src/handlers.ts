@@ -48,10 +48,11 @@ export class ToolHandlers {
                 console.warn(`[SNAPSHOT-RECOVERY] Collection '${collectionName}' truly empty — NOT writing recovered entry (would poison client)`);
                 return null;
             }
-            // rowCount is chunk count, not file count. Without a metadata query
-            // we don't have the real file count; the snapshot will be corrected
-            // on the next full index. Using rowCount for both is imprecise but
-            // keeps the state non-zero so the client doesn't misread it as empty.
+            // rowCount is chunk count, not file count (typically 10-100x larger).
+            // Without a metadata query we don't have the real file count;
+            // the snapshot will be corrected on the next full index.
+            // Using rowCount for both is imprecise but keeps the state
+            // non-zero so the client doesn't misread it as empty.
             return { indexedFiles: rowCount, totalChunks: rowCount };
         } catch (error) {
             console.warn(`[SNAPSHOT-RECOVERY] Failed to query stats for '${codebasePath}':`, error);

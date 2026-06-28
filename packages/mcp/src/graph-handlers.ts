@@ -842,6 +842,14 @@ export class GraphToolHandlers {
             go: ['.go'],
             rust: ['.rs'],
             csharp: ['.cs'],
+            ruby: ['.rb'],
+            php: ['.php'],
+            scala: ['.scala'],
+            swift: ['.swift'],
+            kotlin: ['.kt', '.kts'],
+            dart: ['.dart'],
+            lua: ['.lua'],
+            zig: ['.zig'],
         };
         return map[lang] || [];
     }
