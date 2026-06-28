@@ -240,6 +240,7 @@ export class SqliteGraphStore implements GraphStore {
         if (options.namePattern) countParams.push(this.regexToLike(options.namePattern));
         if (options.qnPattern) countParams.push(this.regexToLike(options.qnPattern));
         if (options.filePattern) countParams.push(this.regexToLike(options.filePattern));
+        if (options.exactFilePath) countParams.push(options.exactFilePath);
         const countRow = this.db.prepare(countQuery).get(...countParams) as { total: number };
 
         const results: GraphSearchResult[] = [];
@@ -579,15 +580,13 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     private regexToLike(pattern: string): string {
-        // Convert simple regex patterns to SQL LIKE patterns
-        // Strip regex special chars first, then escape LIKE wildcards last
-        // (order matters: \ in \% must survive the regex strip)
-        // NOTE: . and + are NOT stripped — they are valid in file paths and qualified names
+        // Convert regex-like patterns to SQL LIKE patterns.
+        // Strip regex metacharacters that are meaningless in file paths/names.
+        // Preserve \ (path separator) and | (alternation) for file path patterns.
         const escaped = pattern
-            .replace(/[*?^${}()|[\]\\]/g, '')
+            .replace(/[*?^${}()[\]]/g, '')
             .replace(/%/g, '\\%')
-            .replace(/_/g, '\\_')
-            .replace(/^%|%$/g, '');
+            .replace(/_/g, '\\_');
         return '%' + escaped + '%';
     }
 }

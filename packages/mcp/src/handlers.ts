@@ -1,6 +1,5 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as crypto from "crypto";
 import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
@@ -11,7 +10,6 @@ import type { GraphToolHandlers } from "./graph-handlers.js";
 export class ToolHandlers {
     private context: Context;
     private snapshotManager: SnapshotManager;
-    private indexingStats: { indexedFiles: number; totalChunks: number } | null = null;
     private currentWorkspace: string;
     /**
      * Tracks active background indexing tasks per absolute codebase path so
@@ -740,7 +738,6 @@ export class ToolHandlers {
 
             // Set codebase to indexed status with complete statistics
             this.snapshotManager.setCodebaseIndexed(absolutePath, stats, indexOptions);
-            this.indexingStats = { indexedFiles: stats.indexedFiles, totalChunks: stats.totalChunks };
 
             // Save snapshot after updating codebase lists
             this.snapshotManager.saveCodebaseSnapshot();
@@ -1101,9 +1098,6 @@ export class ToolHandlers {
 
             // Completely remove the cleared codebase from snapshot
             this.snapshotManager.removeCodebaseCompletely(absolutePath);
-
-            // Reset indexing stats if this was the active codebase
-            this.indexingStats = null;
 
             // Save snapshot after clearing index
             this.snapshotManager.saveCodebaseSnapshot();
