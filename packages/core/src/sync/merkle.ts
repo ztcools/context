@@ -23,6 +23,22 @@ export class MerkleDAG {
 
     public addNode(data: string, parentId?: string): string {
         const nodeId = this.hash(data);
+
+        // If node already exists, just update parent relationship if needed
+        const existingNode = this.nodes.get(nodeId);
+        if (existingNode) {
+            if (parentId) {
+                const parentNode = this.nodes.get(parentId);
+                if (parentNode) {
+                    existingNode.parents.push(parentId);
+                    parentNode.children.push(nodeId);
+                    this.nodes.set(parentId, parentNode);
+                }
+            }
+            this.nodes.set(nodeId, existingNode);
+            return nodeId;
+        }
+
         const node: MerkleDAGNode = {
             id: nodeId,
             hash: nodeId,
@@ -31,7 +47,6 @@ export class MerkleDAG {
             children: []
         };
 
-        // If there's a parent, create the relationship
         if (parentId) {
             const parentNode = this.nodes.get(parentId);
             if (parentNode) {
@@ -40,7 +55,6 @@ export class MerkleDAG {
                 this.nodes.set(parentId, parentNode);
             }
         } else {
-            // If no parent, it's a root node
             this.rootIds.push(nodeId);
         }
 
