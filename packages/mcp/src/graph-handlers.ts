@@ -90,13 +90,13 @@ export class GraphToolHandlers {
             let nodeCount = 0;
             let edgeCount = 0;
 
-            // Full mode: clear old project data before re-indexing
+            this.store.beginTransaction();
+
+            // Full mode: clear old project data before re-indexing (inside transaction)
             if (mode === 'full') {
                 this.store.deleteProject(project);
                 console.log(`[GraphIndex] Cleared existing graph data for '${project}'`);
             }
-
-            this.store.beginTransaction();
 
             for (const filePath of files) {
                 const ext = path.extname(filePath);
@@ -142,7 +142,12 @@ export class GraphToolHandlers {
             }
 
             // ── Cross-file call resolution ────────────────────────
-            const crossEdges = this.resolveCrossFileCalls(project);
+            let crossEdges = 0;
+            try {
+                crossEdges = this.resolveCrossFileCalls(project);
+            } catch (err: any) {
+                console.warn(`[GraphIndex] Cross-file call resolution failed for '${project}': ${err.message}`);
+            }
             edgeCount += crossEdges;
 
             this.store.commitTransaction();

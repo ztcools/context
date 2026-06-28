@@ -436,6 +436,7 @@ export class ToolHandlers {
             }
 
             // Check if already indexing (compare by identity: url:branch)
+            let alreadyCleared = false;
             if (this.snapshotManager.getIndexingCodebases().includes(codebaseIdentity)) {
                 if (forceReindex) {
                     console.log(`[FORCE-REINDEX] Clearing stale indexing state for '${absolutePath}'`);
@@ -448,6 +449,7 @@ export class ToolHandlers {
                     }
                     this.snapshotManager.removeCodebaseCompletely(absolutePath);
                     this.snapshotManager.saveCodebaseSnapshot();
+                    alreadyCleared = true;
                 } else {
                     return {
                         content: [{
@@ -495,8 +497,10 @@ export class ToolHandlers {
 
             // If force reindex and codebase is already indexed, remove it
             if (forceReindex) {
-                this.snapshotManager.removeCodebaseCompletely(absolutePath);
-                this.snapshotManager.saveCodebaseSnapshot();
+                if (!alreadyCleared) {
+                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                    this.snapshotManager.saveCodebaseSnapshot();
+                }
                 if (await this.context.hasIndex(absolutePath)) {
                     console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
                     await this.context.clearIndex(absolutePath);
