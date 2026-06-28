@@ -232,6 +232,9 @@ export class GraphExtractor {
             // ── Pass 2: Resolve calls and create edges ──────────────
             this.resolveCalls(tree.rootNode, source, ctx, config, nodes, registry, edges);
 
+            // ── Pass 3: Collect HTTP routes ───────────────────────
+            this.collectRoutes(tree.rootNode, source, ctx, nodes, registry, edges);
+
             return { nodes, edges };
         } catch (error) {
             console.warn(`[GraphExtractor] Failed to parse ${ctx.filePath}:`, error);
@@ -589,6 +592,333 @@ export class GraphExtractor {
             return raw.replace(/^['"]|['"]$/g, '');
         }
         return null;
+    }
+
+    // ── Private: Route extraction ───────────────────────────────────
+
+    /**
+     * Pass 3: Collect HTTP route definitions from source code.
+     * Detects common patterns: Express, FastAPI, Flask, Spring, Gin, ASP.NET, etc.
+     */
+    private collectRoutes(
+        node: Parser.SyntaxNode,
+        source: string,
+        ctx: ExtractionContext,
+        nodes: Omit<GraphNode, 'id'>[],
+        registry: Map<string, NameEntry>,
+        edges: Omit<GraphEdge, 'id'>[],
+    ): void {
+        const routeInfo = this.tryExtractRoute(node, source, ctx.language);
+        if (routeInfo) {
+            const { method, path: routePath, handlerName } = routeInfo;
+            const routeQN = `${ctx.project}.route.${ctx.filePath.replace(/\//g, '.')}.${method}:${routePath}`;
+            const routeIdx = nodes.length;
+            nodes.push({
+                project: ctx.project,
+                label: 'Route',
+                name: `${method} ${routePath}`,
+                qualifiedName: routeQN,
+                filePath: ctx.filePath,
+                startLine: node.startPosition.row + 1,
+                endLine: node.endPosition.row + 1,
+                properties: { method, path: routePath, handlerName, language: ctx.language },
+            });
+
+            // Link route to handler function if found in registry
+            if (handlerName) {
+                const entry = registry.get(handlerName);
+                if (entry) {
+                    edges.push({
+                        project: ctx.project,
+                        sourceId: routeIdx,
+                        targetId: entry.nodeIndex,
+                        type: 'HANDLES' as any,
+                        properties: { method, path: routePath },
+                    });
+                }
+            }
+            return;
+        }
+
+        // Recurse into children
+        for (let i = 0; i < node.childCount; i++) {
+            this.collectRoutes(node.child(i)!, source, ctx, nodes, registry, edges);
+        }
+    }
+
+    /**
+     * Try to extract an HTTP route definition from a node.
+     * Returns { method, path, handlerName } or null.
+     */
+    private tryExtractRoute(
+        node: Parser.SyntaxNode,
+        source: string,
+        language: string,
+    ): { method: string; path: string; handlerName: string } | null {
+        switch (language) {
+            case 'javascript':
+            case 'typescript':
+                return this.tryExtractJsTsRoute(node, source);
+            case 'python':
+                return this.tryExtractPythonRoute(node, source);
+            case 'java':
+                return this.tryExtractJavaRoute(node, source);
+            case 'go':
+                return this.tryExtractGoRoute(node, source);
+            case 'csharp':
+                return this.tryExtractCSharpRoute(node, source);
+            default:
+                return null;
+        }
+    }
+
+    // ── JS/TS route detection ──────────────────────────────────
+    private tryExtractJsTsRoute(
+        node: Parser.SyntaxNode,
+        source: string,
+    ): { method: string; path: string; handlerName: string } | null {
+        // Pattern: app.get('/path', handler) or router.post('/path', handler)
+        if (node.type === 'call_expression') {
+            const funcNode = node.childForFieldName?.('function');
+            if (funcNode?.type === 'member_expression') {
+                const obj = funcNode.childForFieldName?.('object');
+                const prop = funcNode.childForFieldName?.('property');
+                if (obj && prop) {
+                    const methodName = source.slice(prop.startIndex, prop.endIndex);
+                    const knownMethods = ['get', 'post', 'put', 'delete', 'patch', 'head', 'options', 'all', 'use'];
+                    if (knownMethods.includes(methodName.toLowerCase())) {
+                        const args = this.findChildrenByType(node, 'arguments');
+                        const argNodes = args.length > 0 ? this.getDirectChildren(args[0]!) : [];
+                        // First argument should be the path string
+                        if (argNodes.length >= 1) {
+                            const pathNode = argNodes[0]!;
+                            const routePath = this.extractStringValue(pathNode, source);
+                            if (routePath) {
+                                let handlerName = '';
+                                if (argNodes.length >= 2) {
+                                    handlerName = this.extractIdentifierName(argNodes[1]!, source);
+                                }
+                                return { method: methodName.toUpperCase(), path: routePath, handlerName };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern: @Get('/path') decorator
+        if (node.type === 'decorator') {
+            const callNode = this.findChildByType(node, 'call_expression');
+            if (callNode) {
+                const funcNode = callNode.childForFieldName?.('function');
+                if (funcNode?.type === 'identifier') {
+                    const decoratorName = source.slice(funcNode.startIndex, funcNode.endIndex);
+                    // Map decorator to HTTP method
+                    const decoratorMap: Record<string, string> = {
+                        'Get': 'GET', 'Post': 'POST', 'Put': 'PUT', 'Delete': 'DELETE',
+                        'Patch': 'PATCH', 'Head': 'HEAD', 'Options': 'OPTIONS', 'All': 'ALL',
+                    };
+                    const method = decoratorMap[decoratorName];
+                    if (method) {
+                        const args = this.findChildrenByType(callNode, 'arguments');
+                        const argNodes = args.length > 0 ? this.getDirectChildren(args[0]!) : [];
+                        if (argNodes.length >= 1) {
+                            const routePath = this.extractStringValue(argNodes[0]!, source);
+                            if (routePath) {
+                                return { method, path: routePath, handlerName: '' };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    // ── Python route detection ─────────────────────────────────
+    private tryExtractPythonRoute(
+        node: Parser.SyntaxNode,
+        source: string,
+    ): { method: string; path: string; handlerName: string } | null {
+        // Pattern: @app.route('/path', methods=['GET'])
+        // Pattern: @router.get('/path') (FastAPI)
+        // Pattern: @bp.get('/path') (Flask Blueprint)
+        if (node.type === 'decorator') {
+            const callNode = this.findChildByType(node, 'call');
+            if (callNode) {
+                const funcNode = callNode.childForFieldName?.('function');
+                if (funcNode) {
+                    const funcName = source.slice(funcNode.startIndex, funcNode.endIndex);
+                    // @app.route('/path')
+                    if (funcName === 'route') {
+                        const args = this.findChildrenByType(callNode, 'argument_list');
+                        if (args.length > 0) {
+                            const argNodes = this.getDirectChildren(args[0]!);
+                            if (argNodes.length >= 1) {
+                                const routePath = this.extractStringValue(argNodes[0]!, source);
+                                if (routePath) {
+                                    let method = 'GET';
+                                    // Check for methods=['POST'] keyword argument
+                                    for (const arg of argNodes) {
+                                        const kwText = source.slice(arg.startIndex, arg.endIndex);
+                                        const methodsMatch = kwText.match(/methods\s*=\s*\[['"]([^'"]+)['"]\]/);
+                                        if (methodsMatch) {
+                                            method = methodsMatch[1]!.toUpperCase();
+                                            break;
+                                        }
+                                    }
+                                    return { method, path: routePath, handlerName: '' };
+                                }
+                            }
+                        }
+                    }
+                    // FastAPI: @router.get('/path'), @app.post('/path')
+                    const httpMethods = ['get', 'post', 'put', 'delete', 'patch', 'head', 'options'];
+                    if (httpMethods.includes(funcName)) {
+                        const args = this.findChildrenByType(callNode, 'argument_list');
+                        if (args.length > 0) {
+                            const argNodes = this.getDirectChildren(args[0]!);
+                            if (argNodes.length >= 1) {
+                                const routePath = this.extractStringValue(argNodes[0]!, source);
+                                if (routePath) {
+                                    return { method: funcName.toUpperCase(), path: routePath, handlerName: '' };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // ── Java route detection ───────────────────────────────────
+    private tryExtractJavaRoute(
+        node: Parser.SyntaxNode,
+        source: string,
+    ): { method: string; path: string; handlerName: string } | null {
+        // Pattern: @GetMapping("/path"), @PostMapping("/path"), @RequestMapping("/path")
+        if (node.type === 'marker_annotation' || node.type === 'annotation') {
+            const nameNode = this.findChildByType(node, 'identifier', 'type_identifier');
+            if (nameNode) {
+                const annoName = source.slice(nameNode.startIndex, nameNode.endIndex);
+                const annoMap: Record<string, string> = {
+                    'GetMapping': 'GET', 'PostMapping': 'POST', 'PutMapping': 'PUT',
+                    'DeleteMapping': 'DELETE', 'PatchMapping': 'PATCH',
+                    'RequestMapping': 'ALL',
+                };
+                const method = annoMap[annoName];
+                if (method) {
+                    const strNode = this.findChildByType(node, 'string_literal');
+                    if (strNode) {
+                        const routePath = source.slice(strNode.startIndex + 1, strNode.endIndex - 1);
+                        return { method, path: routePath, handlerName: '' };
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // ── Go route detection ─────────────────────────────────────
+    private tryExtractGoRoute(
+        node: Parser.SyntaxNode,
+        source: string,
+    ): { method: string; path: string; handlerName: string } | null {
+        // Pattern: r.GET("/path", handler)
+        if (node.type === 'call_expression') {
+            const funcNode = node.childForFieldName?.('function');
+            if (funcNode?.type === 'selector_expression') {
+                const prop = funcNode.childForFieldName?.('field');
+                if (prop) {
+                    const methodName = source.slice(prop.startIndex, prop.endIndex);
+                    const knownMethods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'HandleFunc'];
+                    if (knownMethods.includes(methodName)) {
+                        const args = this.findChildrenByType(node, 'argument_list');
+                        if (args.length > 0) {
+                            const argNodes = this.getDirectChildren(args[0]!);
+                            if (argNodes.length >= 1) {
+                                const routePath = this.extractStringValue(argNodes[0]!, source);
+                                if (routePath) {
+                                    let handlerName = '';
+                                    if (argNodes.length >= 2) {
+                                        handlerName = this.extractIdentifierName(argNodes[1]!, source);
+                                    }
+                                    const method = methodName === 'HandleFunc' ? 'ALL' : methodName.toUpperCase();
+                                    return { method, path: routePath, handlerName };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // ── C# route detection ─────────────────────────────────────
+    private tryExtractCSharpRoute(
+        node: Parser.SyntaxNode,
+        source: string,
+    ): { method: string; path: string; handlerName: string } | null {
+        // Pattern: [HttpGet("/path")], [HttpPost("/path")], [Route("/path")]
+        if (node.type === 'attribute') {
+            const nameNode = this.findChildByType(node, 'identifier', 'type_identifier');
+            if (nameNode) {
+                const attrName = source.slice(nameNode.startIndex, nameNode.endIndex);
+                const attrMap: Record<string, string> = {
+                    'HttpGet': 'GET', 'HttpPost': 'POST', 'HttpPut': 'PUT',
+                    'HttpDelete': 'DELETE', 'HttpPatch': 'PATCH',
+                    'Route': 'ALL',
+                };
+                const method = attrMap[attrName];
+                if (method) {
+                    const strNode = this.findChildByType(node, 'string_literal');
+                    if (strNode) {
+                        const routePath = source.slice(strNode.startIndex + 1, strNode.endIndex - 1);
+                        // Handle [Route("[controller]")] template
+                        return { method, path: routePath, handlerName: '' };
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // ── AST value extraction helpers ───────────────────────────────
+
+    private extractStringValue(node: Parser.SyntaxNode, source: string): string | null {
+        if (node.type === 'string' || node.type === 'string_literal') {
+            return source.slice(node.startIndex + 1, node.endIndex - 1);
+        }
+        if (node.type === 'string_fragment') {
+            return source.slice(node.startIndex, node.endIndex);
+        }
+        // Template literal (JS/TS)
+        if (node.type === 'template_string') {
+            return source.slice(node.startIndex + 1, node.endIndex - 1).replace(/\$\{[^}]*\}/g, ':param');
+        }
+        return null;
+    }
+
+    private extractIdentifierName(node: Parser.SyntaxNode, source: string): string {
+        if (node.type === 'identifier') {
+            return source.slice(node.startIndex, node.endIndex);
+        }
+        if (node.type === 'arrow_function' || node.type === 'function_expression') {
+            return '';
+        }
+        const id = this.findChildByType(node, 'identifier');
+        return id ? source.slice(id.startIndex, id.endIndex) : '';
+    }
+
+    private getDirectChildren(node: Parser.SyntaxNode): Parser.SyntaxNode[] {
+        const children: Parser.SyntaxNode[] = [];
+        for (let i = 0; i < node.childCount; i++) {
+            children.push(node.child(i)!);
+        }
+        return children;
     }
 
     // ── Private: AST navigation helpers ────────────────────────────
