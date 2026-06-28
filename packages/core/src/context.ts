@@ -20,6 +20,7 @@ import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
 import { getRepoIdentity } from './utils/git-identity';
@@ -1124,7 +1125,9 @@ export class Context {
             '.mm': 'objective-c',
             '.dart': 'dart',
             '.sol': 'solidity',
-            '.ipynb': 'jupyter'
+            '.ipynb': 'jupyter',
+            '.md': 'markdown',
+            '.markdown': 'markdown',
         };
         return languageMap[ext] || 'text';
     }
@@ -1247,7 +1250,7 @@ export class Context {
      */
     private async loadGlobalIgnoreFile(): Promise<string[]> {
         try {
-            const homeDir = require('os').homedir();
+            const homeDir = os.homedir();
             const globalIgnorePath = path.join(homeDir, '.context', '.contextignore');
             return await this.loadIgnoreFile(globalIgnorePath, 'global .contextignore');
         } catch (error) {
@@ -1471,7 +1474,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             return {
                 type: 'ast',
                 hasBuiltinFallback: true,
@@ -1493,7 +1495,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             return AstCodeSplitter.isLanguageSupported(language);
         }
 
@@ -1509,7 +1510,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             const isSupported = AstCodeSplitter.isLanguageSupported(language);
 
             return {

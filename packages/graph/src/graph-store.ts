@@ -256,10 +256,14 @@ export class SqliteGraphStore implements GraphStore {
             });
         }
 
+        // Adjust total to reflect degree-filtered results
+        const hasDegreeFilter = options.minDegree !== undefined || options.maxDegree !== undefined;
+        const effectiveTotal = hasDegreeFilter ? results.length : countRow.total;
+
         return {
             results,
-            total: countRow.total,
-            hasMore: offset + results.length < countRow.total,
+            total: effectiveTotal,
+            hasMore: offset + results.length < effectiveTotal,
         };
     }
 
