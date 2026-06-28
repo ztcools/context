@@ -88,426 +88,137 @@ class ContextMcpServer {
 
     private setupTools() {
         const index_description = `
-Index a codebase directory to enable semantic search. The codebase is identified by its git remote URL + branch name (not by filesystem path), so the same repository cloned to different locations shares a single index.
+Index a codebase to enable intelligent code search. One call handles both vector indexing (Milvus) and knowledge graph construction (SQLite). The codebase is identified by its git remote URL + branch name, so team members sharing the same repo+branch can reuse each other's indexes.
 
 ⚠️ **IMPORTANT**:
-- The 'path' parameter accepts paths, relative paths (resolved against the current working directory), or "." to auto-detect the IDE workspace root.
-- Before indexing, the system checks if the repository (identified by git URL + branch) is already indexed in the vector database. If already indexed, indexing is skipped unless force=true.
+- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace.
+- Before indexing, the system checks if the repository is already indexed. If already indexed, indexing is skipped unless force=true.
 
-✨ **Usage Guidance**:
-- Use this tool when the user wants to index a project for semantic search.
-- If the user does not specify a path, default to "." (current workspace).
-- If the user says "index this project", "index the current workspace", or "index /path/to/project", call this tool.
-- The system isolates indexes by git URL + branch, so team members sharing the same repo+branch can reuse each other's indexes.
+✨ **Usage**: Just call this once when starting work on a project. The system handles everything internally — vector search, code graph, call tracing — all automatically available.
 `;
-
 
         const search_description = `
-Search the indexed codebase using natural language queries. The codebase is identified by its git remote URL + branch, so searches work across different local checkouts of the same repository.
+Search the indexed codebase using natural language. Returns code snippets enriched with graph context (related functions, classes, call relationships). The system automatically combines vector search and knowledge graph analysis internally.
 
-⚠️ **IMPORTANT**:
-- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.
-- If the codebase is not yet indexed, the tool returns an error - use index_codebase first.
-
-🎯 **When to Use**:
-This tool is versatile and can be used before completing various tasks to retrieve relevant context:
-- **Code search**: Find specific functions, classes, or implementations
-- **Context-aware assistance**: Gather relevant code context before making changes
-- **Issue identification**: Locate problematic code sections or bugs
-- **Code review**: Understand existing implementations and patterns
-- **Refactoring**: Find all related code pieces that need to be updated
-- **Feature development**: Understand existing architecture and similar implementations
-- **Duplicate detection**: Identify redundant or duplicated code patterns across the codebase
-
-✨ **Usage Guidance**:
-- If the codebase is not indexed, this tool will return a clear error message indicating that indexing is required first.
-- You can then use the index_codebase tool to index the codebase before searching again.
+✨ **Usage**: Just search with a natural language query. The system automatically chooses the best search strategy and enriches results with structural context.
 `;
 
-        // Define available tools
         this.server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
-                        name: "index_codebase",
+                        name: "index",
                         description: index_description,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to index. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided. The path is only used to locate the project on disk; the index is identified by git URL + branch.`
+                                    description: "Path to the codebase directory to index. Defaults to current workspace.",
                                 },
                                 force: {
                                     type: "boolean",
                                     description: "Force re-indexing even if already indexed",
-                                    default: false
+                                    default: false,
                                 },
                                 splitter: {
                                     type: "string",
-                                    description: "Code splitter to use: 'ast' for syntax-aware splitting with automatic fallback, 'langchain' for character-based splitting",
+                                    description: "Code splitter: 'ast' (syntax-aware) or 'langchain' (character-based)",
                                     enum: ["ast", "langchain"],
-                                    default: "ast"
+                                    default: "ast",
                                 },
                                 customExtensions: {
                                     type: "array",
-                                    items: {
-                                        type: "string"
-                                    },
-                                    description: "Optional: Additional file extensions to include beyond defaults (e.g., ['.vue', '.svelte', '.astro']). Extensions should include the dot prefix or will be automatically added",
-                                    default: []
+                                    items: { type: "string" },
+                                    description: "Additional file extensions beyond defaults",
+                                    default: [],
                                 },
                                 ignorePatterns: {
                                     type: "array",
-                                    items: {
-                                        type: "string"
-                                    },
-                                    description: "Optional: Additional ignore patterns to exclude specific files/directories beyond defaults. Only include this parameter if the user explicitly requests custom ignore patterns (e.g., ['static/**', '*.tmp', 'private/**'])",
-                                    default: []
-                                }
-                            }
-                        }
+                                    items: { type: "string" },
+                                    description: "Additional ignore patterns beyond defaults",
+                                    default: [],
+                                },
+                            },
+                        },
                     },
                     {
-                        name: "search_code",
+                        name: "search",
                         description: search_description,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to search in. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                                    description: "Codebase path to search in. Defaults to current workspace.",
                                 },
                                 query: {
                                     type: "string",
-                                    description: "Natural language query to search for in the codebase"
+                                    description: "Natural language query",
                                 },
                                 limit: {
                                     type: "number",
-                                    description: "Maximum number of results to return",
+                                    description: "Max results (default 10, max 50)",
                                     default: 10,
-                                    maximum: 50
+                                    maximum: 50,
                                 },
                                 extensionFilter: {
                                     type: "array",
-                                    items: {
-                                        type: "string"
-                                    },
-                                    description: "Optional: List of file extensions to filter results. (e.g., ['.ts','.py']).",
-                                    default: []
-                                }
+                                    items: { type: "string" },
+                                    description: "Filter by file extensions (e.g. ['.ts', '.py'])",
+                                    default: [],
+                                },
                             },
-                            required: ["query"]
-                        }
+                            required: ["query"],
+                        },
                     },
                     {
-                        name: "clear_index",
-                        description: `Clear the search index. The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                        name: "clear",
+                        description: "Clear all indexes (vector + graph) for a codebase.",
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to clear. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
-                                }
-                            }
-                        }
+                                    description: "Codebase path to clear. Defaults to current workspace.",
+                                },
+                            },
+                        },
                     },
                     {
-                        name: "get_indexing_status",
-                        description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases. The codebase is identified by its git remote URL + branch, so status works across different local checkouts of the same repository.
-
-⚠️ **IMPORTANT**:
-- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                        name: "status",
+                        description: "Get indexing status — vector index (Milvus) and graph index (SQLite) combined.",
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to check status for. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
-                                }
-                            }
-                        }
-                    },
-                    // ── Graph Knowledge Tools ───────────────────────────
-                    {
-                        name: "index_repository",
-                        description: `Index a repository into the knowledge graph for structured code analysis. This is complementary to index_codebase (vector index) — it builds a graph of functions, classes, methods, imports, and calls. Use this to enable structured queries like call tracing, architecture analysis, and graph search.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                repo_path: {
-                                    type: "string",
-                                    description: "Path to the repository to index"
+                                    description: "Codebase path to check. Defaults to current workspace.",
                                 },
-                                mode: {
-                                    type: "string",
-                                    enum: ["full", "incremental"],
-                                    default: "full",
-                                    description: "Indexing mode: full (all files), incremental (git diff changed files only)"
-                                },
-                                files: {
-                                    type: "array",
-                                    items: { type: "string" },
-                                    description: "Specific files to re-index (relative paths). Overrides mode."
-                                }
                             },
-                            required: ["repo_path"]
-                        }
+                        },
                     },
-                    {
-                        name: "search_graph",
-                        description: `Search the code knowledge graph for functions, classes, methods, and variables. Use INSTEAD of grep/glob when finding code definitions, implementations, or relationships. Supports BM25 full-text search, regex patterns, and degree filtering.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier (git URL + branch)" },
-                                query: { type: "string", description: "Natural-language or keyword full-text search" },
-                                label: { type: "string", description: "Filter by node label (Function, Class, Method, etc.)" },
-                                name_pattern: { type: "string", description: "Regex pattern on node name" },
-                                qn_pattern: { type: "string", description: "Regex pattern on qualified name" },
-                                file_pattern: { type: "string", description: "Regex pattern on file path" },
-                                min_degree: { type: "integer", description: "Minimum degree (in+out edges)" },
-                                max_degree: { type: "integer", description: "Maximum degree (in+out edges)" },
-                                limit: { type: "integer", default: 200, description: "Max results per call" },
-                                offset: { type: "integer", default: 0, description: "Pagination offset" }
-                            },
-                            required: ["project"]
-                        }
-                    },
-                    {
-                        name: "trace_path",
-                        description: `Trace call paths through the code graph. Modes: calls (callers/callees), data_flow (value propagation), cross_service (HTTP/async). Use INSTEAD OF grep for callers, dependencies, impact analysis.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" },
-                                function_name: { type: "string", description: "Function name to trace from" },
-                                direction: { type: "string", enum: ["inbound", "outbound", "both"], default: "both" },
-                                depth: { type: "integer", default: 3, description: "Max traversal depth" },
-                                mode: { type: "string", enum: ["calls", "data_flow", "cross_service"], default: "calls" },
-                                include_tests: { type: "boolean", default: false }
-                            },
-                            required: ["project", "function_name"]
-                        }
-                    },
-                    {
-                        name: "get_code_snippet",
-                        description: `Read source code for a function/class/symbol by qualified name. First call search_graph to find the exact qualified_name, then pass it here.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" },
-                                qualified_name: { type: "string", description: "Full qualified_name from search_graph" },
-                                include_neighbors: { type: "boolean", default: false, description: "Include caller/callee names" }
-                            },
-                            required: ["project", "qualified_name"]
-                        }
-                    },
-                    {
-                        name: "get_graph_schema",
-                        description: `Get the schema of the knowledge graph (node labels, edge types).`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" }
-                            },
-                            required: ["project"]
-                        }
-                    },
-                    {
-                        name: "get_architecture",
-                        description: `Get high-level architecture overview — packages, services, dependencies, entry points, and directory clusters.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" },
-                                path: { type: "string", description: "Optional directory prefix to scope analysis" }
-                            },
-                            required: ["project"]
-                        }
-                    },
-                    {
-                        name: "search_code_graph",
-                        description: `Graph-augmented code search. Finds text patterns via grep, then enriches results with the knowledge graph — deduplicates matches into containing functions. Modes: compact (default), full, files.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" },
-                                pattern: { type: "string", description: "Text pattern to search for" },
-                                file_pattern: { type: "string", description: "Glob for file filtering (e.g. *.go)" },
-                                path_filter: { type: "string", description: "Regex filter on result file paths" },
-                                mode: { type: "string", enum: ["compact", "full", "files"], default: "compact" },
-                                regex: { type: "boolean", default: false },
-                                limit: { type: "integer", default: 10, description: "Max enriched results" }
-                            },
-                            required: ["project", "pattern"]
-                        }
-                    },
-                    {
-                        name: "list_projects",
-                        description: `List all graph-indexed projects.`,
-                        inputSchema: { type: "object", properties: {} }
-                    },
-                    {
-                        name: "delete_project",
-                        description: `Delete a project from the graph index.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier to delete" }
-                            },
-                            required: ["project"]
-                        }
-                    },
-                    {
-                        name: "index_status",
-                        description: `Get the graph indexing status of a project.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" }
-                            },
-                            required: ["project"]
-                        }
-                    },
-                    {
-                        name: "detect_changes",
-                        description: `Detect code changes and their potential impact on the graph.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" },
-                                base_branch: { type: "string", default: "main" }
-                            },
-                            required: ["project"]
-                        }
-                    },
-                    {
-                        name: "query_graph",
-                        description: `Execute a Cypher-like query on the knowledge graph. Supports: MATCH (n) WHERE n.name = 'X' RETURN n`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" },
-                                query: { type: "string", description: "Cypher-like query: MATCH (n) WHERE n.name = 'X' RETURN n" }
-                            },
-                            required: ["project", "query"]
-                        }
-                    },
-                    {
-                        name: "manage_adr",
-                        description: `Manage Architecture Decision Records (ADRs). Actions: list, create, update.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                action: { type: "string", enum: ["list", "create", "update"], default: "list" },
-                                project: { type: "string", description: "Project identifier" },
-                                title: { type: "string", description: "ADR title (for create)" },
-                                content: { type: "string", description: "ADR content (for create/update)" },
-                                id: { type: "integer", description: "ADR id (for update)" },
-                                status: { type: "string", enum: ["proposed", "accepted", "deprecated", "superseded"], description: "ADR status" }
-                            },
-                            required: ["action"]
-                        }
-                    },
-                    {
-                        name: "ingest_traces",
-                        description: `Ingest HTTP/async trace data for cross-service call analysis. Accepts trace records with source service, target service, HTTP method, path, and status code.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                project: { type: "string", description: "Project identifier" },
-                                traces: {
-                                    type: "array",
-                                    description: "Array of trace records",
-                                    items: {
-                                        type: "object",
-                                        properties: {
-                                            source_service: { type: "string", description: "Source service name" },
-                                            target_service: { type: "string", description: "Target service name" },
-                                            method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "GRPC", "MESSAGE", "EVENT"] },
-                                            path: { type: "string", description: "HTTP path or RPC method" },
-                                            status_code: { type: "integer", description: "HTTP status code" },
-                                            duration_ms: { type: "number", description: "Request duration in milliseconds" },
-                                            timestamp: { type: "string", description: "ISO timestamp" }
-                                        },
-                                        required: ["source_service", "target_service", "method", "path"]
-                                    }
-                                }
-                            },
-                            required: ["project", "traces"]
-                        }
-                    },
-                    {
-                        name: "fusion_search",
-                        description: `Combined vector + graph search. Runs semantic vector search AND knowledge graph search simultaneously, then merges and ranks results. Returns code snippets enriched with graph metadata (function/class context, callers, callees). Use this as the primary search tool when you want comprehensive results.`,
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                path: { type: "string", description: "Codebase path for vector search", default: "." },
-                                project: { type: "string", description: "Project identifier for graph search" },
-                                query: { type: "string", description: "Search query" },
-                                limit: { type: "integer", default: 10, description: "Max results" },
-                                extension_filter: {
-                                    type: "array",
-                                    items: { type: "string" },
-                                    description: "Filter by file extensions (e.g. ['.ts', '.py'])"
-                                }
-                            },
-                            required: ["query"]
-                        }
-                    },
-                ]
+                ],
             };
         });
 
-        // Handle tool execution
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
             const safeArgs = args || {};
 
             switch (name) {
+                case "index":
                 case "index_codebase":
-                    return await this.toolHandlers.handleIndexCodebase(args);
+                    return await this.toolHandlers.handleIndex(args);
+                case "search":
                 case "search_code":
                     return await this.toolHandlers.handleSearchCode(args);
+                case "clear":
                 case "clear_index":
                     return await this.toolHandlers.handleClearIndex(args);
+                case "status":
                 case "get_indexing_status":
-                    return await this.toolHandlers.handleGetIndexingStatus(args);
-
-                // ── Graph Knowledge Tools ───────────────────────────
-                case "index_repository":
-                    return await this.graphToolHandlers.handleIndexRepository(safeArgs);
-                case "search_graph":
-                    return this.graphToolHandlers.handleSearchGraph(safeArgs);
-                case "trace_path":
-                    return this.graphToolHandlers.handleTracePath(safeArgs);
-                case "get_code_snippet":
-                    return this.graphToolHandlers.handleGetCodeSnippet(safeArgs);
-                case "get_graph_schema":
-                    return this.graphToolHandlers.handleGetGraphSchema(safeArgs);
-                case "get_architecture":
-                    return this.graphToolHandlers.handleGetArchitecture(safeArgs);
-                case "search_code_graph":
-                    return this.graphToolHandlers.handleSearchCodeGraph(safeArgs);
-                case "list_projects":
-                    return this.graphToolHandlers.handleListProjects();
-                case "delete_project":
-                    return this.graphToolHandlers.handleDeleteProject(safeArgs);
-                case "index_status":
-                    return this.graphToolHandlers.handleIndexStatus(safeArgs);
-                case "detect_changes":
-                    return this.graphToolHandlers.handleDetectChanges(safeArgs);
-                case "query_graph":
-                    return this.graphToolHandlers.handleQueryGraph(safeArgs);
-                case "manage_adr":
-                    return this.graphToolHandlers.handleManageAdr(safeArgs);
-                case "ingest_traces":
-                    return this.graphToolHandlers.handleIngestTraces(safeArgs);
-                case "fusion_search":
-                    return await this.handleFusionSearch(safeArgs);
+                    return await this.toolHandlers.handleStatus(args);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);

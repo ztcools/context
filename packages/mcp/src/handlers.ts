@@ -339,6 +339,37 @@ export class ToolHandlers {
         }
     }
 
+    // ── Unified Index: Vector + Graph ─────────────────────────────
+    /**
+     * Single entry point for indexing. Runs vector index (Milvus) and
+     * graph index (SQLite) in sequence. Developers only need to call this
+     * once — the system handles both indexes internally.
+     */
+    public async handleIndex(args: any) {
+        // 1. Run vector indexing (same as handleIndexCodebase)
+        const vectorResult = await this.handleIndexCodebase(args);
+
+        // 2. Also run graph indexing in the background
+        // Start graph indexing after vector completes — graph is synchronous
+        // so it's fast enough to run inline
+        if (this.graphToolHandlers) {
+            const { path: codebasePath = "." } = args;
+            const absolutePath = resolveCodebasePath(codebasePath);
+            try {
+                const graphResult = await this.graphToolHandlers.handleIndexRepository({
+                    repo_path: absolutePath,
+                    mode: 'full',
+                });
+                const graphText = graphResult.content[0]?.text || '';
+                console.log(`[INDEX] Graph indexing completed: ${graphText.substring(0, 120)}...`);
+            } catch (e: any) {
+                console.warn(`[INDEX] Graph indexing failed (non-fatal): ${e.message}`);
+            }
+        }
+
+        return vectorResult;
+    }
+
     public async handleIndexCodebase(args: any) {
         const { path: codebasePath = ".", force, splitter, customExtensions, ignorePatterns } = args;
         const forceReindex = force || false;
@@ -894,6 +925,39 @@ export class ToolHandlers {
             }
             resultMessage += `\n\n${formattedResults}`;
 
+            // ── Graph Context Enrichment ─────────────────────────────
+            if (this.graphToolHandlers) {
+                try {
+                    const project = getRepoIdentity(searchCodebasePath);
+                    const graphLines: string[] = [];
+                    const seenFiles = new Set<string>();
+
+                    for (const result of searchResults.slice(0, 3)) {
+                        if (seenFiles.has(result.relativePath)) continue;
+                        seenFiles.add(result.relativePath);
+
+                        const nodeResult = this.graphToolHandlers.getStore().findNodes({
+                            project,
+                            filePattern: result.relativePath,
+                            limit: 5,
+                        });
+
+                        for (const r of nodeResult.results) {
+                            const n = r.node;
+                            graphLines.push(`  ${n.label} \`${n.name}\` (${n.filePath}:${n.startLine}-${n.endLine})`);
+                        }
+                    }
+
+                    if (graphLines.length > 0) {
+                        resultMessage += `\n\n## Related Graph Context\n`;
+                        resultMessage += graphLines.join('\n');
+                    }
+                } catch (graphErr: any) {
+                    // Non-fatal: graph enrichment is best-effort
+                    console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
+                }
+            }
+
             if (isIndexing) {
                 resultMessage += `\n\n💡 **Tip**: This codebase is still being indexed. More results may become available as indexing progresses.`;
             }
@@ -1080,6 +1144,42 @@ export class ToolHandlers {
                 isError: true
             };
         }
+    }
+
+    // ── Unified Status: Vector + Graph ─────────────────────────────
+    /**
+     * Single entry point for status. Merges vector index status (Milvus)
+     * and graph index status (SQLite) into one response.
+     */
+    public async handleStatus(args: any) {
+        const { path: codebasePath = "." } = args;
+        const lines: string[] = [];
+
+        // 1. Vector index status
+        const vectorResult = await this.handleGetIndexingStatus(args);
+        const vectorText = vectorResult.content[0]?.text || '';
+        lines.push('## Vector Index (Milvus)');
+        lines.push(vectorText);
+        lines.push('');
+
+        // 2. Graph index status
+        if (this.graphToolHandlers) {
+            try {
+                const absolutePath = resolveCodebasePath(codebasePath);
+                const project = getRepoIdentity(absolutePath);
+                const graphResult = this.graphToolHandlers.handleIndexStatus({ project });
+                const graphText = graphResult.content[0]?.text || '';
+                lines.push('## Graph Index (SQLite)');
+                lines.push(graphText);
+            } catch (e: any) {
+                lines.push('## Graph Index (SQLite)');
+                lines.push(`Error: ${e.message}`);
+            }
+        }
+
+        return {
+            content: [{ type: 'text', text: lines.join('\n') }]
+        };
     }
 
     public async handleGetIndexingStatus(args: any) {
