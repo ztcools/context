@@ -784,15 +784,17 @@ export class Context {
             return;
         }
 
+        // Detect dimension BEFORE dropping the old collection to avoid data loss
+        // if dimension detection fails (e.g. invalid API key, network error)
+        console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
+        const dimension = await this.embedding.detectDimension();
+        console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
+
         if (collectionExists && forceReindex) {
             console.log(`[Context] 🗑️  Dropping existing collection ${collectionName} for force reindex...`);
             await this.vectorDatabase.dropCollection(collectionName);
             console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
         }
-
-        console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
-        const dimension = await this.embedding.detectDimension();
-        console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
         const repoIdentity = getRepoIdentity(codebasePath);
 
         if (isHybrid === true) {

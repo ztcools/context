@@ -74,25 +74,46 @@ export class VoyageAIEmbedding extends Embedding {
         const processedTexts = this.preprocessTexts(texts);
         const model = this.config.model || 'voyage-code-3';
 
-        const response = await this.client.embed({
-            input: processedTexts,
-            model: model,
-            inputType: this.inputType,
-        });
+        const maxRetries = 3;
+        let lastError: Error | null = null;
 
-        if (!response.data) {
-            throw new Error('VoyageAI API returned invalid response');
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await this.client.embed({
+                    input: processedTexts,
+                    model: model,
+                    inputType: this.inputType,
+                });
+
+                if (!response.data) {
+                    throw new Error('VoyageAI API returned invalid response');
+                }
+
+                return response.data.map((item) => {
+                    if (!item.embedding) {
+                        throw new Error('VoyageAI API returned invalid embedding data');
+                    }
+                    return {
+                        vector: item.embedding,
+                        dimension: this.dimension
+                    };
+                });
+            } catch (error: any) {
+                lastError = error;
+                const status = error?.status || error?.statusCode || 0;
+                const isRetryable = status === 429 || status >= 500;
+
+                if (isRetryable && attempt < maxRetries - 1) {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    console.warn(`[VoyageAI] Embedding API retryable error (${status}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                break;
+            }
         }
 
-        return response.data.map((item) => {
-            if (!item.embedding) {
-                throw new Error('VoyageAI API returned invalid embedding data');
-            }
-            return {
-                vector: item.embedding,
-                dimension: this.dimension
-            };
-        });
+        throw new Error(`VoyageAI batch embedding failed: ${lastError instanceof Error ? lastError.message : 'Unknown error'}`);
     }
 
     getDimension(): number {

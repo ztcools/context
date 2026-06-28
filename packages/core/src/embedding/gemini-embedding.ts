@@ -80,35 +80,52 @@ export class GeminiEmbedding extends Embedding {
         const processedTexts = this.preprocessTexts(texts);
         const model = this.config.model || 'gemini-embedding-001';
 
-        try {
-            const response = await this.client.models.embedContent({
-                model: model,
-                contents: processedTexts,
-                config: {
-                    outputDimensionality: this.config.outputDimensionality || this.dimension,
-                },
-            });
+        const maxRetries = 3;
+        let lastError: Error | null = null;
 
-            if (!response.embeddings) {
-                throw new Error('Gemini API returned invalid response');
-            }
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await this.client.models.embedContent({
+                    model: model,
+                    contents: processedTexts,
+                    config: {
+                        outputDimensionality: this.config.outputDimensionality || this.dimension,
+                    },
+                });
 
-            if (response.embeddings.length !== processedTexts.length) {
-                throw new Error(`Gemini API returned ${response.embeddings.length} embeddings for ${processedTexts.length} inputs`);
-            }
-
-            return response.embeddings.map((embedding: any) => {
-                if (!embedding.values) {
-                    throw new Error('Gemini API returned invalid embedding data');
+                if (!response.embeddings) {
+                    throw new Error('Gemini API returned invalid response');
                 }
-                return {
-                    vector: embedding.values,
-                    dimension: embedding.values.length
-                };
-            });
-        } catch (error) {
-            throw new Error(`Gemini batch embedding failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+
+                if (response.embeddings.length !== processedTexts.length) {
+                    throw new Error(`Gemini API returned ${response.embeddings.length} embeddings for ${processedTexts.length} inputs`);
+                }
+
+                return response.embeddings.map((embedding: any) => {
+                    if (!embedding.values) {
+                        throw new Error('Gemini API returned invalid embedding data');
+                    }
+                    return {
+                        vector: embedding.values,
+                        dimension: embedding.values.length
+                    };
+                });
+            } catch (error: any) {
+                lastError = error;
+                const status = error?.status || error?.code || 0;
+                const isRetryable = status === 429 || status >= 500;
+
+                if (isRetryable && attempt < maxRetries - 1) {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    console.warn(`[Gemini] Embedding API retryable error (${status}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                break;
+            }
         }
+
+        throw new Error(`Gemini batch embedding failed: ${lastError instanceof Error ? lastError.message : 'Unknown error'}`);
     }
 
     private async embedProcessedText(processedText: string, model: string): Promise<EmbeddingVector> {

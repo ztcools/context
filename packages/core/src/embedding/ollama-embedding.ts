@@ -99,29 +99,54 @@ export class OllamaEmbedding extends Embedding {
             console.log(`[OllamaEmbedding] 📏 Detected Ollama embedding dimension: ${this.dimension} for model: ${this.config.model}`);
         }
 
-        // Use Ollama's native batch embedding API
-        const embedOptions: any = {
-            model: this.config.model,
-            input: processedTexts, // Pass array directly to Ollama
-            options: this.config.options,
-        };
+        const maxRetries = 3;
+        let lastError: Error | null = null;
 
-        // Only include keep_alive if it has a valid value
-        if (this.config.keepAlive && this.config.keepAlive !== '') {
-            embedOptions.keep_alive = this.config.keepAlive;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                // Use Ollama's native batch embedding API
+                const embedOptions: any = {
+                    model: this.config.model,
+                    input: processedTexts, // Pass array directly to Ollama
+                    options: this.config.options,
+                };
+
+                // Only include keep_alive if it has a valid value
+                if (this.config.keepAlive && this.config.keepAlive !== '') {
+                    embedOptions.keep_alive = this.config.keepAlive;
+                }
+
+                const response = await this.client.embed(embedOptions);
+
+                if (!response.embeddings || !Array.isArray(response.embeddings)) {
+                    throw new Error('Ollama API returned invalid batch response');
+                }
+
+                return response.embeddings.map((embedding: any) => {
+                    if (!embedding || embedding.length === undefined) {
+                        throw new Error('Ollama API returned invalid embedding data');
+                    }
+                    return {
+                        vector: embedding,
+                        dimension: embedding.length || this.dimension
+                    };
+                });
+            } catch (error: any) {
+                lastError = error;
+                const status = error?.status || error?.statusCode || 0;
+                const isRetryable = status === 429 || status >= 500 || error?.message?.includes('ECONNREFUSED');
+
+                if (isRetryable && attempt < maxRetries - 1) {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    console.warn(`[Ollama] Embedding API retryable error (${status}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                break;
+            }
         }
 
-        const response = await this.client.embed(embedOptions);
-
-        if (!response.embeddings || !Array.isArray(response.embeddings)) {
-            throw new Error('Ollama API returned invalid batch response');
-        }
-
-        // Convert to EmbeddingVector format
-        return response.embeddings.map((embedding: number[]) => ({
-            vector: embedding,
-            dimension: this.dimension
-        }));
+        throw new Error(`Ollama batch embedding failed: ${lastError instanceof Error ? lastError.message : 'Unknown error'}`);
     }
 
     getDimension(): number {
