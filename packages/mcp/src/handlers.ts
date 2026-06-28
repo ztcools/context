@@ -1552,7 +1552,7 @@ export class ToolHandlers {
                 try {
                     const traceResult = this.graphToolHandlers!.handleTracePath({
                         project,
-                        function_name: r.node.name,
+                        function_name: r.node.qualifiedName,
                         direction: 'both',
                         depth: 3,
                         mode: 'calls',
