@@ -894,7 +894,7 @@ export class Context {
                     // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
                         try {
-                            await this.processChunkBuffer(chunkBuffer);
+                            await this.processChunkBuffer(chunkBuffer, signal);
                         } catch (error) {
                             // Embedding errors (such as API having no quota) halt the entire indexing process and propagate upwards.
                             if (error instanceof EmbeddingError) {
@@ -941,7 +941,7 @@ export class Context {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
             console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
             try {
-                await this.processChunkBuffer(chunkBuffer);
+                await this.processChunkBuffer(chunkBuffer, signal);
             } catch (error) {
                 if (error instanceof EmbeddingError) {
                     throw error;
@@ -967,8 +967,12 @@ export class Context {
     /**
  * Process accumulated chunk buffer
  */
-    private async processChunkBuffer(chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>): Promise<void> {
+    private async processChunkBuffer(
+        chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>,
+        signal?: AbortSignal
+    ): Promise<void> {
         if (chunkBuffer.length === 0) return;
+        if (signal?.aborted) return;
 
         // Extract chunks and ensure they all have the same codebasePath
         const chunks = chunkBuffer.map(item => item.chunk);

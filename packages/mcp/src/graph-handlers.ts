@@ -93,7 +93,8 @@ export class GraphToolHandlers {
             this.store.beginTransaction();
 
             // Full mode: clear old project data before re-indexing (inside transaction)
-            if (mode === 'full') {
+            // Skip deleteProject when specificFiles is provided to avoid data loss
+            if (mode === 'full' && !specificFiles) {
                 this.store.deleteProject(project);
                 console.log(`[GraphIndex] Cleared existing graph data for '${project}'`);
             }

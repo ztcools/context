@@ -571,7 +571,7 @@ export class SqliteGraphStore implements GraphStore {
             .replace(/([a-z])([A-Z])/g, '$1 $2')
             .split(/[\s_\-.:/]+/)
             .filter(t => t.length > 0);
-        return tokens.map(t => `"${t}"`).join(' OR ');
+        return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
     }
 
     private regexToLike(pattern: string): string {
