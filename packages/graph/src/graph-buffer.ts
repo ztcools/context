@@ -408,6 +408,15 @@ export class InMemoryGraphBuffer {
         }
     }
 
+    /** Get all unique file paths of nodes in the buffer. */
+    getAllFiles(): string[] {
+        const files = new Set<string>();
+        for (const [, node] of this.nodeByQN) {
+            files.add(node.filePath);
+        }
+        return Array.from(files);
+    }
+
     // ── Search (compatible with GraphStore interface) ─────────────
 
     /**
@@ -506,25 +515,38 @@ export class InMemoryGraphBuffer {
      * Mirrors the dump phase in cbm_write_db.
      *
      * @param store - The target SQLite store (must implement GraphStore interface)
+     * @param options - clearProject: if false, skips DELETE (for incremental). deleteFiles: file paths to delete before insert.
      */
     flushToStore(store: {
         upsertNode(node: Omit<GraphNode, 'id'>): number;
         upsertEdge(edge: Omit<GraphEdge, 'id'>): number;
         beginTransaction(): void;
         commitTransaction(): void;
+        rollbackTransaction(): void;
         deleteProject(project: string): void;
-    }): { nodes: number; edges: number } {
+        deleteNodesByFile(project: string, filePath: string): void;
+    }, options?: { clearProject?: boolean; deleteFiles?: string[] }): { nodes: number; edges: number } {
         let nodeCount = 0;
         let edgeCount = 0;
 
+        // Map buffer-internal IDs → SQLite assigned IDs (for foreign key resolution)
+        const idMap = new Map<number, number>();
+
         store.beginTransaction();
         try {
-            // Clear old project data
-            store.deleteProject(this.project);
+            if (options?.clearProject !== false) {
+                // Full mode: clear all project data
+                store.deleteProject(this.project);
+            } else if (options?.deleteFiles) {
+                // Incremental mode: delete only nodes for specific files
+                for (const filePath of options.deleteFiles) {
+                    store.deleteNodesByFile(this.project, filePath);
+                }
+            }
 
-            // Insert all nodes
+            // Insert all nodes, capturing SQLite IDs
             for (const [, node] of this.nodeByQN) {
-                store.upsertNode({
+                const realId = store.upsertNode({
                     project: node.project,
                     label: node.label,
                     name: node.name,
@@ -534,15 +556,22 @@ export class InMemoryGraphBuffer {
                     endLine: node.endLine,
                     properties: node.properties,
                 });
+                idMap.set(node.id, realId);
                 nodeCount++;
             }
 
-            // Insert all edges
+            // Insert all edges using mapped SQLite IDs
             for (const [, edge] of this.edgeByKey) {
+                const realSourceId = idMap.get(edge.sourceId);
+                const realTargetId = idMap.get(edge.targetId);
+                if (realSourceId === undefined || realTargetId === undefined) {
+                    console.warn(`[GraphBuffer] Skipping edge ${edge.id}: source/target node not found`);
+                    continue;
+                }
                 store.upsertEdge({
                     project: edge.project,
-                    sourceId: edge.sourceId,
-                    targetId: edge.targetId,
+                    sourceId: realSourceId,
+                    targetId: realTargetId,
                     type: edge.type,
                     properties: edge.properties,
                 });
@@ -551,8 +580,9 @@ export class InMemoryGraphBuffer {
 
             store.commitTransaction();
         } catch (e) {
+            console.error('[GraphBuffer] flushToStore error:', e);
             try {
-                store.commitTransaction();
+                store.rollbackTransaction();
             } catch {
                 // Best effort
             }

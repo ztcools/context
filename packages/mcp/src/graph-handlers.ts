@@ -187,7 +187,16 @@ export class GraphToolHandlers {
             console.log(`[GraphIndex] Phase 2 done: ${crossEdges} cross-file call edges resolved`);
 
             // ── Phase 3: Flush to SQLite ──────────────────────────
-            const { nodes: writtenNodes, edges: writtenEdges } = graphBuffer.flushToStore(this.store);
+            console.log(`[GraphIndex] Phase 3: flushing ${nodeCount} nodes, ${edgeCount} edges to SQLite...`);
+
+            // For incremental: delete old nodes for specific files before flushing
+            // For full: delete the entire project
+            const isIncremental = !!(specificFiles || mode === 'incremental');
+            const { nodes: writtenNodes, edges: writtenEdges } = graphBuffer.flushToStore(this.store, {
+                clearProject: !isIncremental,
+                deleteFiles: isIncremental ? [...new Set(graphBuffer.getAllFiles())] : undefined,
+            });
+            console.log(`[GraphIndex] Phase 3 done: ${writtenNodes} nodes, ${writtenEdges} edges written`);
             this.indexingProgress.delete(project);
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -198,6 +207,7 @@ export class GraphToolHandlers {
                 }],
             };
         } catch (error: any) {
+            console.error(`[GraphIndex] Error: ${error.message}`, error);
             this.store.rollbackTransaction();
             this.indexingProgress.delete(project);
             return {
