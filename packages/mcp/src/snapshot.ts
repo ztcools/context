@@ -183,7 +183,19 @@ export class SnapshotManager {
         // Merge file-based identities with in-memory state.
         // File may be stale (read-only FS, cross-process writes), so always
         // include in-memory entries that may have been added since last save.
-        const fileIdentities = new Set<string>();
+        // IMPORTANT: in-memory state overrides file — if a codebase is "indexing"
+        // in memory, it must NOT appear in the "indexed" list even if the stale
+        // file still says "indexed". Otherwise syncIndexedCodebasesFromCloud
+        // will removeCodebaseCompletely() and wipe the in-memory indexing state.
+        const result = new Set<string>();
+
+        // Add in-memory indexed entries first (most authoritative)
+        for (const id of this.indexedCodebases) {
+            result.add(id);
+        }
+
+        // Add file entries, but only if the in-memory codebaseInfoMap doesn't
+        // have a conflicting status (e.g. "indexing" that should override)
         try {
             if (fs.existsSync(this.snapshotFilePath)) {
                 const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
@@ -193,13 +205,21 @@ export class SnapshotManager {
                     for (const [key, info] of Object.entries(snapshot.codebases)) {
                         if (info.status === 'indexed') {
                             const id = (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key;
-                            fileIdentities.add(id);
+                            // Only include if in-memory doesn't have a conflicting status
+                            const memInfo = this.codebaseInfoMap.get(id);
+                            if (!memInfo || memInfo.status === 'indexed') {
+                                result.add(id);
+                            }
                         }
                     }
                 } else {
                     const indexed = snapshot.indexedCodebases || [];
                     for (const p of indexed) {
-                        fileIdentities.add(this.toIdentity(p));
+                        const id = this.toIdentity(p);
+                        const memInfo = this.codebaseInfoMap.get(id);
+                        if (!memInfo || memInfo.status === 'indexed') {
+                            result.add(id);
+                        }
                     }
                 }
             }
@@ -207,19 +227,25 @@ export class SnapshotManager {
             console.warn(`[SNAPSHOT-DEBUG] Error reading indexed codebases from file:`, error);
         }
 
-        // Merge in-memory state (may have entries added since last save, e.g. on read-only FS)
-        for (const id of this.indexedCodebases) {
-            fileIdentities.add(id);
-        }
-
-        return Array.from(fileIdentities);
+        return Array.from(result);
     }
 
     public getIndexingCodebases(): string[] {
         // Merge file-based identities with in-memory state.
         // File may be stale (read-only FS, cross-process writes), so always
         // include in-memory entries that may have been added since last save.
-        const fileIdentities = new Set<string>();
+        // IMPORTANT: in-memory state overrides file — if a codebase is "indexed"
+        // in memory, it must NOT appear in the "indexing" list even if the stale
+        // file still says "indexing".
+        const result = new Set<string>();
+
+        // Add in-memory indexing entries first (most authoritative)
+        for (const id of this.indexingCodebases.keys()) {
+            result.add(id);
+        }
+
+        // Add file entries, but only if the in-memory codebaseInfoMap doesn't
+        // have a conflicting status (e.g. "indexed" that should override)
         try {
             if (fs.existsSync(this.snapshotFilePath)) {
                 const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
@@ -229,17 +255,28 @@ export class SnapshotManager {
                     for (const [key, info] of Object.entries(snapshot.codebases)) {
                         if (info.status === 'indexing') {
                             const id = (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key;
-                            fileIdentities.add(id);
+                            const memInfo = this.codebaseInfoMap.get(id);
+                            if (!memInfo || memInfo.status === 'indexing') {
+                                result.add(id);
+                            }
                         }
                     }
                 } else {
                     if (Array.isArray(snapshot.indexingCodebases)) {
                         for (const p of snapshot.indexingCodebases) {
-                            fileIdentities.add(this.toIdentity(p));
+                            const id = this.toIdentity(p);
+                            const memInfo = this.codebaseInfoMap.get(id);
+                            if (!memInfo || memInfo.status === 'indexing') {
+                                result.add(id);
+                            }
                         }
                     } else if (snapshot.indexingCodebases && typeof snapshot.indexingCodebases === 'object') {
                         for (const p of Object.keys(snapshot.indexingCodebases)) {
-                            fileIdentities.add(this.toIdentity(p));
+                            const id = this.toIdentity(p);
+                            const memInfo = this.codebaseInfoMap.get(id);
+                            if (!memInfo || memInfo.status === 'indexing') {
+                                result.add(id);
+                            }
                         }
                     }
                 }
@@ -248,12 +285,7 @@ export class SnapshotManager {
             console.warn(`[SNAPSHOT-DEBUG] Error reading indexing codebases from file:`, error);
         }
 
-        // Merge in-memory state (may have entries added since last save, e.g. on read-only FS)
-        for (const id of this.indexingCodebases.keys()) {
-            fileIdentities.add(id);
-        }
-
-        return Array.from(fileIdentities);
+        return Array.from(result);
     }
 
     /**
