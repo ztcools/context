@@ -5,6 +5,7 @@
  */
 export * from './types';
 export * from './graph-store';
+export * from './graph-buffer';
 export * from './extractor';
 export * from './tracer';
 export * from './searcher';
