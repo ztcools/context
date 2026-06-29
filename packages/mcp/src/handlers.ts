@@ -289,7 +289,7 @@ export class ToolHandlers {
             // so team members sharing the same repo+branch are recognized.
             for (const [identity, localPath] of localIdentityMap) {
                 if (!cloudCodebases.has(identity)) {
-                    this.snapshotManager.removeCodebaseCompletely(localPath);
+                    this.snapshotManager.removeCodebaseByIdentity(identity, localPath);
                     hasChanges = true;
 
                     try {

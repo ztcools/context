@@ -662,16 +662,29 @@ export class SnapshotManager {
      */
     public removeCodebaseCompletely(codebasePath: string): void {
         const identity = this.toIdentity(codebasePath);
+        this.removeCodebaseByIdentity(identity, codebasePath);
+    }
+
+    /**
+     * Remove a codebase by identity (url:branch) directly.
+     * Unlike removeCodebaseCompletely, this does NOT resolve the path
+     * to the current git identity — it uses the given identity as-is.
+     * This is critical when the identity is from a stale file entry
+     * whose branch no longer matches the current checkout.
+     */
+    public removeCodebaseByIdentity(identity: string, codebasePath?: string): void {
         this.indexedCodebases = this.indexedCodebases.filter(id => id !== identity);
         this.indexingCodebases.delete(identity);
         this.codebaseFileCount.delete(identity);
         this.codebaseInfoMap.delete(identity);
         this.recentlyRemoved.add(identity);
         // Clear identity cache for this path (and any aliases)
-        const resolved = path.resolve(codebasePath);
-        this.identityCache.delete(resolved);
+        if (codebasePath) {
+            const resolved = path.resolve(codebasePath);
+            this.identityCache.delete(resolved);
+        }
 
-        console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath} (identity: ${identity})`);
+        console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath || identity} (identity: ${identity})`);
     }
 
     public loadCodebaseSnapshot(): void {
