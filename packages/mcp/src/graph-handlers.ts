@@ -208,7 +208,11 @@ export class GraphToolHandlers {
             };
         } catch (error: any) {
             console.error(`[GraphIndex] Error: ${error.message}`, error);
-            this.store.rollbackTransaction();
+            try {
+                this.store.rollbackTransaction();
+            } catch {
+                // Transaction may already be rolled back by flushToStore
+            }
             this.indexingProgress.delete(project);
             return {
                 content: [{ type: 'text', text: `Error indexing repository: ${error.message}` }],
@@ -981,14 +985,46 @@ export class GraphToolHandlers {
         }
     }
 
+    /**
+     * Scan source files using git ls-files. Respects .gitignore automatically
+     * and avoids scanning untracked / ignored directories (e.g. test fixtures).
+     * Falls back to filesystem walk if git is not available.
+     */
     private scanFiles(dir: string, extensions: string[]): string[] {
-        const results: string[] = [];
         const extSet = new Set(extensions);
+        const results: string[] = [];
 
+        // Try git ls-files first — respects .gitignore and is much faster
+        try {
+            const extPatterns = extensions.map((e) => `"*${e}"`).join(' ');
+            const output = execSync(`git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns}`, {
+                encoding: 'utf-8',
+                timeout: 10_000,
+                maxBuffer: 10 * 1024 * 1024,
+            });
+            const lines = output.trim().split('\n').filter(Boolean);
+            for (const line of lines) {
+                const fullPath = path.join(dir, line);
+                // Only include files that actually exist (--others may list deleted files)
+                if (fs.existsSync(fullPath)) {
+                    results.push(fullPath);
+                }
+            }
+            return results;
+        } catch {
+            // Fallback: filesystem walk with IGNORE_DIRS filter
+        }
+
+        // Fallback filesystem walk
         const stack: string[] = [dir];
         while (stack.length > 0) {
             const current = stack.pop()!;
-            const entries = fs.readdirSync(current, { withFileTypes: true });
+            let entries: fs.Dirent[];
+            try {
+                entries = fs.readdirSync(current, { withFileTypes: true });
+            } catch {
+                continue;
+            }
             for (const entry of entries) {
                 if (IGNORE_DIRS.has(entry.name)) continue;
                 const fullPath = path.join(current, entry.name);
@@ -1005,25 +1041,54 @@ export class GraphToolHandlers {
 
     /**
      * Scan for infrastructure-as-code files: Dockerfiles and K8s manifests.
+     * Uses git ls-files when available, falls back to filesystem walk.
      */
     private scanIaCFiles(dir: string): string[] {
         const results: string[] = [];
 
+        try {
+            const output = execSync(`git -C "${dir}" ls-files --cached --others --exclude-standard`, {
+                encoding: 'utf-8',
+                timeout: 10_000,
+                maxBuffer: 10 * 1024 * 1024,
+            });
+            const lines = output.trim().split('\n').filter(Boolean);
+            for (const line of lines) {
+                const fullPath = path.join(dir, line);
+                if (!fs.existsSync(fullPath)) continue;
+                const entryName = path.basename(line);
+                if (GraphExtractor.isDockerfile(entryName)) {
+                    results.push(fullPath);
+                }
+                const ext = path.extname(entryName);
+                if ((ext === '.yaml' || ext === '.yml') && this.isK8sPath(path.dirname(fullPath))) {
+                    results.push(fullPath);
+                }
+            }
+            return results;
+        } catch {
+            // Fallback
+        }
+
+        // Fallback filesystem walk
         const stack: string[] = [dir];
         while (stack.length > 0) {
             const current = stack.pop()!;
-            const entries = fs.readdirSync(current, { withFileTypes: true });
+            let entries: fs.Dirent[];
+            try {
+                entries = fs.readdirSync(current, { withFileTypes: true });
+            } catch {
+                continue;
+            }
             for (const entry of entries) {
                 if (IGNORE_DIRS.has(entry.name)) continue;
                 const fullPath = path.join(current, entry.name);
                 if (entry.isDirectory()) {
                     stack.push(fullPath);
                 } else if (entry.isFile()) {
-                    // Dockerfile detection
                     if (GraphExtractor.isDockerfile(entry.name)) {
                         results.push(fullPath);
                     }
-                    // K8s YAML: only in k8s/deploy/infra directories with .yaml/.yml
                     const ext = path.extname(entry.name);
                     if ((ext === '.yaml' || ext === '.yml') && this.isK8sPath(current)) {
                         results.push(fullPath);
