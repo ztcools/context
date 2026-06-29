@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { execSync } from 'child_process';
 import { FileSynchronizer } from './sync/synchronizer';
 import { getRepoIdentity } from './utils/git-identity';
 import { matchGlob } from './utils/glob-matcher';
@@ -830,6 +831,27 @@ export class Context {
     ): Promise<string[]> {
         const files: string[] = [];
 
+        // Try git ls-files first — respects .gitignore and is much faster
+        try {
+            const extPatterns = supportedExtensions.map((e) => `"*${e}"`).join(' ');
+            const output = execSync(`git -C "${codebasePath}" ls-files --cached --others --exclude-standard -- ${extPatterns}`, {
+                encoding: 'utf-8',
+                timeout: 10_000,
+                maxBuffer: 10 * 1024 * 1024,
+            });
+            const lines = output.trim().split('\n').filter(Boolean);
+            for (const line of lines) {
+                const fullPath = path.join(codebasePath, line);
+                if (fs.existsSync(fullPath)) {
+                    files.push(fullPath);
+                }
+            }
+            return files;
+        } catch {
+            // Fallback: filesystem walk with ignore patterns
+        }
+
+        // Fallback filesystem walk
         const traverseDirectory = async (currentPath: string) => {
             const entries = await fs.promises.readdir(currentPath, { withFileTypes: true });
 
