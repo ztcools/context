@@ -143,7 +143,7 @@ if command -v claude &> /dev/null; then
             -e EMBEDDING_DIMENSION=768 \
             -e MILVUS_ADDRESS=http://10.50.4.149:19530 \
             -e EMBEDDING_BATCH_SIZE=256 \
-            -- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
+-- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
                 echo "  CLI 配置失败，尝试直接写入配置文件..."
                 add_mcp_to_json "$CLAUDE_JSON" && echo -e "${GREEN}  ✓ MCP 已写入 $CLAUDE_JSON${NC}"
             }
@@ -155,7 +155,7 @@ if command -v claude &> /dev/null; then
             -e EMBEDDING_DIMENSION=768 \
             -e MILVUS_ADDRESS=http://10.50.4.149:19530 \
             -e EMBEDDING_BATCH_SIZE=256 \
-            -- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
+-- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
                 echo "  CLI 配置失败，尝试直接写入配置文件..."
                 add_mcp_to_json "$CLAUDE_JSON" && echo -e "${GREEN}  ✓ MCP 已写入 $CLAUDE_JSON${NC}"
             }

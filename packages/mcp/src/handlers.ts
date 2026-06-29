@@ -1,16 +1,15 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as crypto from "crypto";
 import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
-import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
+import type { CodebaseIndexOptions, CodebaseInfoIndexFailed, CodebaseInfoIndexing, CodebaseInfoIndexed, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
 import { resolveCodebasePath, truncateContent, trackCodebasePath } from "./utils.js";
+import type { GraphToolHandlers } from "./graph-handlers.js";
 
 export class ToolHandlers {
     private context: Context;
     private snapshotManager: SnapshotManager;
-    private indexingStats: { indexedFiles: number; totalChunks: number } | null = null;
     private currentWorkspace: string;
     /**
      * Tracks active background indexing tasks per absolute codebase path so
@@ -19,11 +18,13 @@ export class ToolHandlers {
      * the background task keeps embedding chunks and writing them into the
      * just-cleared collection (issue #199).
      */
+    private graphToolHandlers: GraphToolHandlers | null = null;
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
 
-    constructor(context: Context, snapshotManager: SnapshotManager) {
+    constructor(context: Context, snapshotManager: SnapshotManager, graphToolHandlers?: GraphToolHandlers) {
         this.context = context;
         this.snapshotManager = snapshotManager;
+        this.graphToolHandlers = graphToolHandlers || null;
         this.currentWorkspace = process.cwd();
         console.log(`[WORKSPACE] Current workspace: ${this.currentWorkspace}`);
     }
@@ -48,10 +49,11 @@ export class ToolHandlers {
                 console.warn(`[SNAPSHOT-RECOVERY] Collection '${collectionName}' truly empty — NOT writing recovered entry (would poison client)`);
                 return null;
             }
-            // rowCount is chunk count, not file count. Without a metadata query
-            // we don't have the real file count; the snapshot will be corrected
-            // on the next full index. Using rowCount for both is imprecise but
-            // keeps the state non-zero so the client doesn't misread it as empty.
+            // rowCount is chunk count, not file count (typically 10-100x larger).
+            // Without a metadata query we don't have the real file count;
+            // the snapshot will be corrected on the next full index.
+            // Using rowCount for both is imprecise but keeps the state
+            // non-zero so the client doesn't misread it as empty.
             return { indexedFiles: rowCount, totalChunks: rowCount };
         } catch (error) {
             console.warn(`[SNAPSHOT-RECOVERY] Failed to query stats for '${codebasePath}':`, error);
@@ -166,6 +168,8 @@ export class ToolHandlers {
      */
     private async syncIndexedCodebasesFromCloud(): Promise<void> {
         try {
+            // Clear stale identity cache before syncing (handles remote URL/branch changes)
+            this.snapshotManager.clearIdentityCache();
             console.log(`[SYNC-CLOUD] 🔄 Syncing indexed codebases from Zilliz Cloud...`);
 
             // Get all collections using the interface method
@@ -220,9 +224,9 @@ export class ToolHandlers {
                         try {
                             const results = await vectorDb.query(
                                 collectionName,
-                                undefined as any, // Don't pass empty filter
-                                ['metadata'], // Only fetch metadata field
-                                1 // Only need one result to extract codebasePath
+                                undefined,
+                                ['metadata'],
+                                1
                             );
 
                             if (results && results.length > 0) {
@@ -285,7 +289,7 @@ export class ToolHandlers {
             // so team members sharing the same repo+branch are recognized.
             for (const [identity, localPath] of localIdentityMap) {
                 if (!cloudCodebases.has(identity)) {
-                    this.snapshotManager.removeCodebaseCompletely(localPath);
+                    this.snapshotManager.removeCodebaseByIdentity(identity, localPath);
                     hasChanges = true;
 
                     try {
@@ -335,7 +339,96 @@ export class ToolHandlers {
         }
     }
 
-    public async handleIndexCodebase(args: any) {
+    // ── Unified Index: Vector + Graph ─────────────────────────────
+    /**
+     * Single entry point for indexing. Runs vector index (Milvus) and
+     * graph index (SQLite). Vector index runs first and returns immediately;
+     * graph index runs in background to avoid blocking MCP response.
+     */
+    public async handleIndex(args: any) {
+        const { path: codebasePath = ".", mode: graphMode = "full" } = args;
+        const absolutePath = resolveCodebasePath(codebasePath);
+
+        // 1. Run vector indexing (same as handleIndexCodebase)
+        const vectorResult = await this.handleIndexCodebase(args);
+
+        // If vector indexing returned a real error (not "already indexed"), skip graph indexing
+        const vectorText = vectorResult.content[0]?.text || '';
+        const isAlreadyIndexed = vectorResult.isError && vectorText.includes('already indexed');
+        if (vectorResult.isError && !isAlreadyIndexed) {
+            return vectorResult;
+        }
+
+        // 2. Graph indexing — always attempt, even if vector indicates "already indexed"
+        if (this.graphToolHandlers) {
+            const project = getRepoIdentity(absolutePath);
+            const stats = this.graphToolHandlers.getStore().getProjectStats(project);
+            const alreadyGraphIndexed = stats.nodes > 0;
+
+            // Defer graph indexing to background to avoid blocking MCP response
+            setImmediate(async () => {
+                try {
+                    let graphResult: { content: Array<{ type: string; text: string }> } | undefined;
+                    if (alreadyGraphIndexed && !args.force) {
+                        console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), checking for changes...`);
+
+                        let changedFiles: string[] = [];
+                        try {
+                            const detectResult = this.graphToolHandlers!.detectChangedFiles({ project });
+                            if (detectResult) {
+                                changedFiles = detectResult.changedFiles;
+                            }
+                        } catch {
+                            // change detection failure shouldn't block
+                        }
+
+                        if (changedFiles.length > 0) {
+                            console.log(`[INDEX] Detected ${changedFiles.length} changed files, running incremental graph index`);
+                            graphResult = await this.graphToolHandlers!.handleIndexRepository({
+                                repo_path: absolutePath,
+                                mode: 'incremental',
+                                files: changedFiles,
+                            });
+                        } else {
+                            console.log(`[INDEX] No changes detected for '${project}', skipping graph indexing`);
+                        }
+                    } else {
+                        graphResult = await this.graphToolHandlers!.handleIndexRepository({
+                            repo_path: absolutePath,
+                            mode: graphMode,
+                        });
+                    }
+
+                    // Check for errors in the returned content (handleIndexRepository
+                    // returns errors as text, not by throwing)
+                    if (graphResult) {
+                        const text = graphResult.content[0]?.text || '';
+                        if (text.startsWith('Error')) {
+                            console.error(`[INDEX] Graph indexing error: ${text}`);
+                        } else {
+                            console.log(`[INDEX] Graph indexing completed for '${project}'`);
+                        }
+                    }
+                } catch (e: any) {
+                    console.warn(`[INDEX] Graph indexing failed (non-fatal): ${e.message}`);
+                }
+            });
+
+            const graphNote = alreadyGraphIndexed && !args.force
+                ? `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (checking for changes in background)`
+                : `\n\n[Graph] Indexing in background...`;
+            const responseText = vectorText + graphNote;
+            return {
+                ...vectorResult,
+                isError: false, // Don't block on "already indexed" — graph is still processing
+                content: [{ type: 'text', text: responseText }],
+            };
+        }
+
+        return vectorResult;
+    }
+
+    private async handleIndexCodebase(args: any) {
         const { path: codebasePath = ".", force, splitter, customExtensions, ignorePatterns } = args;
         const forceReindex = force || false;
         const requestedSplitter = splitter || 'ast'; // Default to AST
@@ -356,7 +449,7 @@ export class ToolHandlers {
                     isError: true
                 };
             }
-            const splitterType: RequestSplitterType = requestedSplitter;
+            const splitterType = requestedSplitter; // narrowed by isRequestSplitterType above
             const indexOptions: CodebaseIndexOptions = {
                 requestSplitter: splitterType,
                 requestCustomExtensions: customFileExtensions,
@@ -436,11 +529,20 @@ export class ToolHandlers {
             }
 
             // Check if already indexing (compare by identity: url:branch)
+            let alreadyCleared = false;
             if (this.snapshotManager.getIndexingCodebases().includes(codebaseIdentity)) {
                 if (forceReindex) {
                     console.log(`[FORCE-REINDEX] Clearing stale indexing state for '${absolutePath}'`);
+                    // Cancel the old indexing task and wait for it to finish
+                    const oldTask = this.indexingTasks.get(absolutePath);
+                    if (oldTask) {
+                        oldTask.controller.abort();
+                        try { await oldTask.promise; } catch { /* aborted */ }
+                        this.indexingTasks.delete(absolutePath);
+                    }
                     this.snapshotManager.removeCodebaseCompletely(absolutePath);
                     this.snapshotManager.saveCodebaseSnapshot();
+                    alreadyCleared = true;
                 } else {
                     return {
                         content: [{
@@ -453,25 +555,28 @@ export class ToolHandlers {
             }
 
             //Check if the snapshot and cloud index are in sync (compare by identity)
-            const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
-            const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
-            if (snapshotHasIndex !== vectorDbHasIndex) {
-                if (vectorDbHasIndex && !snapshotHasIndex) {
-                    // Query Milvus for real row count. If unknown/empty, log and move on
-                    // without writing 0/0+completed (which would trigger the force-reindex
-                    // loop in Issue #295). The user is about to (re)index anyway.
-                    const stats = await this.queryCollectionStats(absolutePath);
-                    if (stats) {
-                        console.warn(`[INDEX-VALIDATION] Recovering missing snapshot for '${absolutePath}' (rows=${stats.totalChunks})`);
-                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+            // Skip consistency check when forceReindex already cleared the snapshot
+            if (!alreadyCleared) {
+                const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
+                const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
+                if (snapshotHasIndex !== vectorDbHasIndex) {
+                    if (vectorDbHasIndex && !snapshotHasIndex) {
+                        // Query Milvus for real row count. If unknown/empty, log and move on
+                        // without writing 0/0+completed (which would trigger the force-reindex
+                        // loop in Issue #295). The user is about to (re)index anyway.
+                        const stats = await this.queryCollectionStats(absolutePath);
+                        if (stats) {
+                            console.warn(`[INDEX-VALIDATION] Recovering missing snapshot for '${absolutePath}' (rows=${stats.totalChunks})`);
+                            this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                            this.snapshotManager.saveCodebaseSnapshot();
+                        } else {
+                            console.warn(`[INDEX-VALIDATION] VectorDB reports index for '${absolutePath}' but row count unknown/zero — not writing snapshot entry`);
+                        }
+                    } else if (!vectorDbHasIndex && snapshotHasIndex) {
+                        console.warn(`[INDEX-VALIDATION] Clearing stale snapshot for '${absolutePath}'`);
+                        this.snapshotManager.removeCodebaseCompletely(absolutePath);
                         this.snapshotManager.saveCodebaseSnapshot();
-                    } else {
-                        console.warn(`[INDEX-VALIDATION] VectorDB reports index for '${absolutePath}' but row count unknown/zero — not writing snapshot entry`);
                     }
-                } else if (!vectorDbHasIndex && snapshotHasIndex) {
-                    console.warn(`[INDEX-VALIDATION] Clearing stale snapshot for '${absolutePath}'`);
-                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
-                    this.snapshotManager.saveCodebaseSnapshot();
                 }
             }
 
@@ -488,8 +593,10 @@ export class ToolHandlers {
 
             // If force reindex and codebase is already indexed, remove it
             if (forceReindex) {
-                this.snapshotManager.removeCodebaseCompletely(absolutePath);
-                this.snapshotManager.saveCodebaseSnapshot();
+                if (!alreadyCleared) {
+                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                    this.snapshotManager.saveCodebaseSnapshot();
+                }
                 if (await this.context.hasIndex(absolutePath)) {
                     console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
                     await this.context.clearIndex(absolutePath);
@@ -534,7 +641,7 @@ export class ToolHandlers {
             // Check current status and log if retrying after failure
             const currentStatus = this.snapshotManager.getCodebaseStatus(absolutePath);
             if (currentStatus === 'indexfailed') {
-                const failedInfo = this.snapshotManager.getCodebaseInfo(absolutePath) as any;
+                const failedInfo = this.snapshotManager.getCodebaseInfo(absolutePath) as CodebaseInfoIndexFailed;
                 console.log(`[BACKGROUND-INDEX] Retrying indexing for previously failed codebase. Previous error: ${failedInfo?.errorMessage || 'Unknown error'}`);
             }
 
@@ -668,7 +775,6 @@ export class ToolHandlers {
 
             // Set codebase to indexed status with complete statistics
             this.snapshotManager.setCodebaseIndexed(absolutePath, stats, indexOptions);
-            this.indexingStats = { indexedFiles: stats.indexedFiles, totalChunks: stats.totalChunks };
 
             // Save snapshot after updating codebase lists
             this.snapshotManager.saveCodebaseSnapshot();
@@ -744,9 +850,8 @@ export class ToolHandlers {
             // Check if this codebase is indexed or being indexed
             const indexedCodebasePath = this.snapshotManager.findIndexedCodebasePath(absolutePath);
             const indexingCodebasePath = this.snapshotManager.findIndexingCodebasePath(absolutePath);
-            const matchedCodebase = [indexedCodebasePath, indexingCodebasePath]
-                .filter((codebase): codebase is string => codebase !== undefined)
-                .sort((a, b) => b.length - a.length)[0];
+            // Prefer indexed over indexing (identity-based lookup, no need for path length sort)
+            const matchedCodebase = indexedCodebasePath || indexingCodebasePath;
             let searchCodebasePath = matchedCodebase || absolutePath;
             let isIndexed = indexedCodebasePath === searchCodebasePath;
             const isIndexing = indexingCodebasePath === searchCodebasePath;
@@ -811,7 +916,7 @@ export class ToolHandlers {
                 const invalid = cleaned.filter((e: string) => !(e.startsWith('.') && e.length > 1 && !/\s/.test(e)));
                 if (invalid.length > 0) {
                     return {
-                        content: [{ type: 'text', text: `Error: Invalid file extensions in extensionFilter: ${JSON.stringify(invalid)}. Use proper extensions like '.ts', '.py'.` }],
+                        content: [{ type: 'text', text: `Error: Invalid file extensions in extensionFilter: ${JSON.stringify(invalid)}. Extensions must start with '.' (e.g., '.ts', '.py', '.java').` }],
                         isError: true
                     };
                 }
@@ -831,6 +936,27 @@ export class ToolHandlers {
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
             if (searchResults.length === 0) {
+                // Fallback: try graph search when vector search returns nothing
+                if (this.graphToolHandlers && query.trim().length > 0) {
+                    try {
+                        const project = getRepoIdentity(searchCodebasePath);
+                        const graphResult = this.graphToolHandlers.handleSearchGraph({
+                            project,
+                            query: query,
+                            limit: 10,
+                        });
+                        const graphText = graphResult.content[0]?.text || '';
+                        if (!graphText.includes('Found 0 results')) {
+                            return {
+                                content: [{
+                                    type: 'text', text:
+                                        `No vector search results. Found graph matches:\n\n${graphText}`
+                                }]
+                            };
+                        }
+                    } catch { }
+                }
+
                 // Check if collection was lost (indexed locally but missing in Milvus)
                 if (isIndexed && !isIndexing) {
                     const collectionName = this.context.getCollectionName(searchCodebasePath);
@@ -875,6 +1001,18 @@ export class ToolHandlers {
                 resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
             }
             resultMessage += `\n\n${formattedResults}`;
+
+            // ── Graph Context Enrichment (deep 3-layer) ──────────────────
+            if (this.graphToolHandlers) {
+                try {
+                    resultMessage += this.enrichWithGraphContextDeep(
+                        searchResults,
+                        searchCodebasePath,
+                    );
+                } catch (graphErr: any) {
+                    console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
+                }
+            }
 
             if (isIndexing) {
                 resultMessage += `\n\n💡 **Tip**: This codebase is still being indexed. More results may become available as indexing progresses.`;
@@ -988,7 +1126,7 @@ export class ToolHandlers {
 
             try {
                 await this.context.clearIndex(absolutePath);
-                console.log(`[CLEAR] Successfully cleared index for: ${absolutePath}`);
+                console.log(`[CLEAR] Successfully cleared vector index for: ${absolutePath}`);
             } catch (error: any) {
                 const errorMsg = `Failed to clear ${absolutePath}: ${error.message}`;
                 console.error(`[CLEAR] ${errorMsg}`);
@@ -1001,11 +1139,21 @@ export class ToolHandlers {
                 };
             }
 
+            // Also clear the graph index to keep vector + graph in sync
+            if (this.graphToolHandlers) {
+                try {
+                    this.graphToolHandlers.getStore().beginTransaction();
+                    this.graphToolHandlers.getStore().deleteProject(codebaseIdentity);
+                    this.graphToolHandlers.getStore().commitTransaction();
+                    console.log(`[CLEAR] Successfully cleared graph index for: ${codebaseIdentity}`);
+                } catch (graphError: any) {
+                    console.warn(`[CLEAR] Failed to clear graph index for '${codebaseIdentity}': ${graphError.message}`);
+                    // Non-fatal: vector index is already cleared, graph data can be cleaned up later
+                }
+            }
+
             // Completely remove the cleared codebase from snapshot
             this.snapshotManager.removeCodebaseCompletely(absolutePath);
-
-            // Reset indexing stats if this was the active codebase
-            this.indexingStats = null;
 
             // Save snapshot after clearing index
             this.snapshotManager.saveCodebaseSnapshot();
@@ -1049,6 +1197,88 @@ export class ToolHandlers {
                 isError: true
             };
         }
+    }
+
+    // ── Unified Status: Vector + Graph ─────────────────────────────
+    /**
+     * Single entry point for status. Merges vector index status (Milvus)
+     * and graph index status (SQLite) into one response.
+     */
+    public async handleStatus(args: any) {
+        const { path: codebasePath = "." } = args;
+        const lines: string[] = [];
+
+        // 1. Vector index status
+        const vectorResult = await this.handleGetIndexingStatus(args);
+        const vectorText = vectorResult.content[0]?.text || '';
+        lines.push('## Vector Index (Milvus)');
+        lines.push(vectorText);
+        lines.push('');
+
+        // 2. Graph index status
+        if (this.graphToolHandlers) {
+            try {
+                const absolutePath = resolveCodebasePath(codebasePath);
+                const project = getRepoIdentity(absolutePath);
+                const store = this.graphToolHandlers.getStore();
+                const stats = store.getProjectStats(project);
+
+                lines.push('## Graph Index (SQLite)');
+                lines.push(`  Nodes: ${stats.nodes} | Edges: ${stats.edges}`);
+
+                // Graph indexing progress (if in progress)
+                const graphProgress = this.graphToolHandlers.getIndexingProgress(project);
+                if (graphProgress) {
+                    const pct = graphProgress.total > 0
+                        ? Math.round((graphProgress.current / graphProgress.total) * 100)
+                        : 0;
+                    lines.push(`  Indexing: ${pct}% (${graphProgress.current}/${graphProgress.total} files, ${graphProgress.elapsed.toFixed(1)}s elapsed)`);
+                }
+
+                // Node type breakdown (single aggregate query)
+                const nodeTypeCounts = store.getNodeTypeCounts(project);
+                const typeEntries = Object.entries(nodeTypeCounts);
+                if (typeEntries.length > 0) {
+                    lines.push(`  Types: ${typeEntries.map(([k, v]) => `${k}: ${v}`).join(', ')}`);
+                }
+
+                // Edge type breakdown (single aggregate query)
+                const edgeTypeCounts = store.getEdgeTypeCounts(project);
+                const edgeEntries = Object.entries(edgeTypeCounts);
+                if (edgeEntries.length > 0) {
+                    lines.push(`  Relationships: ${edgeEntries.map(([k, v]) => `${k}: ${v}`).join(', ')}`);
+                }
+
+                // Routes summary
+                const routeResult = store.findNodes({ project, label: 'Route', limit: 100 });
+                if (routeResult.total > 0) {
+                    lines.push(`  Routes: ${routeResult.total}`);
+                    for (const r of routeResult.results.slice(0, 5)) {
+                        lines.push(`    ${r.node.name} (${r.node.filePath}:${r.node.startLine})`);
+                    }
+                    if (routeResult.total > 5) lines.push(`    ... +${routeResult.total - 5} more`);
+                }
+
+                lines.push('');
+
+                // === Architecture overview ===
+                try {
+                    const archResult = this.graphToolHandlers.handleGetArchitecture({ project });
+                    const archText = archResult.content[0]?.text || '';
+                    lines.push('## Architecture');
+                    lines.push(archText);
+                } catch (e: any) {
+                    lines.push(`Architecture analysis failed: ${e.message}`);
+                }
+            } catch (e: any) {
+                lines.push('## Graph Index (SQLite)');
+                lines.push(`Error: ${e.message}`);
+            }
+        }
+
+        return {
+            content: [{ type: 'text', text: lines.join('\n') }]
+        };
     }
 
     public async handleGetIndexingStatus(args: any) {
@@ -1138,8 +1368,8 @@ export class ToolHandlers {
 
             switch (status) {
                 case 'indexed':
-                    if (info && 'indexedFiles' in info) {
-                        const indexedInfo = info as any;
+                    if (info && info.status === 'indexed') {
+                        const indexedInfo = info as CodebaseInfoIndexed;
                         statusMessage = `✅ Codebase '${statusCodebasePath}' is fully indexed and ready for search.`;
                         statusMessage += `\n📊 Statistics: ${indexedInfo.indexedFiles} files, ${indexedInfo.totalChunks} chunks`;
                         statusMessage += `\n📅 Status: ${indexedInfo.indexStatus}`;
@@ -1150,8 +1380,8 @@ export class ToolHandlers {
                     break;
 
                 case 'indexing':
-                    if (info && 'indexingPercentage' in info) {
-                        const indexingInfo = info as any;
+                    if (info && info.status === 'indexing') {
+                        const indexingInfo = info as CodebaseInfoIndexing;
                         const progressPercentage = indexingInfo.indexingPercentage || 0;
                         statusMessage = `🔄 Codebase '${statusCodebasePath}' is currently being indexed. Progress: ${progressPercentage.toFixed(1)}%`;
 
@@ -1168,8 +1398,8 @@ export class ToolHandlers {
                     break;
 
                 case 'indexfailed':
-                    if (info && 'errorMessage' in info) {
-                        const failedInfo = info as any;
+                    if (info && info.status === 'indexfailed') {
+                        const failedInfo = info as CodebaseInfoIndexFailed;
                         statusMessage = `❌ Codebase '${statusCodebasePath}' indexing failed.`;
                         statusMessage += `\n🚨 Error: ${failedInfo.errorMessage}`;
                         if (failedInfo.lastAttemptedPercentage !== undefined) {
@@ -1211,5 +1441,281 @@ export class ToolHandlers {
                 isError: true
             };
         }
+    }
+
+    // ── Graph Context Enrichment ──────────────────────────────────
+    /**
+     * Enrich vector search results with knowledge graph context:
+     * callers, callees, architectural position, and dead code detection.
+     * Returns a formatted string to append to the result message.
+     */
+    private enrichWithGraphContextDeep(
+        searchResults: any[],
+        codebasePath: string,
+        maxContextFiles: number = 10,
+    ): string {
+        const store = this.graphToolHandlers!.getStore();
+        const project = getRepoIdentity(codebasePath);
+        const lines: string[] = [];
+        const seenSymbols = new Set<string>();
+
+        // Collect all unique file paths from search results
+        const seenFiles = new Set<string>();
+        for (const result of searchResults.slice(0, maxContextFiles)) {
+            seenFiles.add(result.relativePath);
+        }
+
+        // === Layer 1: Direct call relationships (batch-queried) ===
+        const allNodeIds = new Set<number>();
+        const fileNodes: Array<{ node: any; filePath: string }> = [];
+
+        for (const filePath of seenFiles) {
+            const normalizedPath = filePath.replace(/^\/+/, '');
+            let nodeResult = store.findNodes({
+                project,
+                exactFilePath: normalizedPath,
+                limit: 20,
+            });
+            if (nodeResult.results.length === 0 && normalizedPath !== filePath) {
+                nodeResult = store.findNodes({
+                    project,
+                    exactFilePath: filePath,
+                    limit: 20,
+                });
+            }
+            for (const r of nodeResult.results) {
+                fileNodes.push({ node: r.node, filePath: normalizedPath });
+                allNodeIds.add(r.node.id);
+            }
+        }
+
+        // Batch-collect all edges in one pass per direction
+        const allCallerEdges = new Map<number, Array<{ sourceId: number; targetId: number; type: string }>>();
+        const allCalleeEdges = new Map<number, Array<{ sourceId: number; targetId: number; type: string }>>();
+
+        for (const { node } of fileNodes) {
+            allCallerEdges.set(node.id, store.getEdgesByTarget(node.id, 'CALLS'));
+            allCalleeEdges.set(node.id, store.getEdgesBySource(node.id, 'CALLS'));
+            for (const e of allCallerEdges.get(node.id)!) allNodeIds.add(e.sourceId);
+            for (const e of allCalleeEdges.get(node.id)!) allNodeIds.add(e.targetId);
+        }
+
+        // Single batch lookup for all referenced nodes
+        const nodeMap = store.getNodesById(Array.from(allNodeIds));
+
+        const directRelations: string[] = [];
+        for (const { node } of fileNodes) {
+            const key = node.qualifiedName;
+            if (seenSymbols.has(key)) continue;
+            seenSymbols.add(key);
+
+            const callerEdges = allCallerEdges.get(node.id) || [];
+            const calleeEdges = allCalleeEdges.get(node.id) || [];
+
+            const callerNames = callerEdges.slice(0, 3).map((e) => {
+                const caller = nodeMap.get(e.sourceId);
+                return caller ? caller.name : '?';
+            });
+            const calleeNames = calleeEdges.slice(0, 3).map((e) => {
+                const callee = nodeMap.get(e.targetId);
+                return callee ? callee.name : '?';
+            });
+
+            let line = `${node.label} \`${node.name}\``;
+            if (callerNames.length > 0) {
+                line += ` ← ${callerNames.join(', ')}`;
+                if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
+            }
+            if (calleeNames.length > 0) {
+                line += ` → ${calleeNames.join(', ')}`;
+                if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
+            }
+            if (callerEdges.length === 0 && calleeEdges.length === 0) {
+                line += ` [unused]`;
+            } else if (callerEdges.length === 0 && node.label === 'Function') {
+                line += ` [entry]`;
+            }
+            line += ` (${node.filePath}:${node.startLine})`;
+            directRelations.push(line);
+        }
+
+        if (directRelations.length > 0) {
+            lines.push('## Graph Context');
+            lines.push(...directRelations.map(l => `  - ${l}`));
+            lines.push('');
+        }
+
+        // === Layer 2: Call chain trace (for top-ranked function) ===
+        for (const result of searchResults.slice(0, 3)) {
+            const normalizedPath = result.relativePath.replace(/^\/+/, '');
+            const nodeResult = store.findNodes({
+                project,
+                exactFilePath: normalizedPath,
+                limit: 5,
+            });
+            for (const r of nodeResult.results) {
+                if (r.node.label !== 'Function' && r.node.label !== 'Method') continue;
+                try {
+                    const traceResult = this.graphToolHandlers!.handleTracePath({
+                        project,
+                        function_name: r.node.qualifiedName,
+                        direction: 'both',
+                        depth: 3,
+                        mode: 'calls',
+                    });
+                    const traceText = traceResult.content[0]?.text || '';
+                    const traceLines = traceText.split('\n');
+                    const filtered = traceLines.filter((l: string) =>
+                        l.startsWith('  [depth=') || l.startsWith('Callers') || l.startsWith('Callees')
+                    );
+                    if (filtered.length > 0) {
+                        lines.push(`### Call Chain: \`${r.node.name}\``);
+                        lines.push(...filtered);
+                        lines.push('');
+                    }
+                } catch {
+                    // trace failure shouldn't affect main flow
+                }
+                break;
+            }
+            break;
+        }
+
+        // === Layer 3: Architecture summary ===
+        try {
+            const archResult = this.graphToolHandlers!.handleGetArchitecture({
+                project,
+            });
+            const archText = archResult.content[0]?.text || '';
+            const archLines = archText.split('\n');
+            const summary: string[] = [];
+            let inEntryPoints = false;
+            let inClusters = false;
+            let clusterCount = 0;
+            for (const line of archLines) {
+                if (line.startsWith('Entry points')) {
+                    inEntryPoints = true;
+                    summary.push(line);
+                    continue;
+                }
+                if (inEntryPoints && line.startsWith('  -')) {
+                    summary.push(line);
+                    continue;
+                }
+                if (inEntryPoints && !line.startsWith('  -')) {
+                    inEntryPoints = false;
+                }
+                if (line.startsWith('Clusters')) {
+                    inClusters = true;
+                    summary.push(line);
+                    continue;
+                }
+                if (inClusters && line.startsWith('  ') && clusterCount < 5) {
+                    summary.push(line);
+                    clusterCount++;
+                    continue;
+                }
+                if (inClusters && clusterCount >= 5) {
+                    inClusters = false;
+                }
+            }
+            if (summary.length > 0) {
+                lines.push('### Architecture');
+                lines.push(...summary);
+                lines.push('');
+            }
+        } catch {
+            // architecture failure shouldn't affect main flow
+        }
+
+        return lines.length > 0 ? '\n\n' + lines.join('\n') : '';
+    }
+
+    /**
+     * @deprecated Use enrichWithGraphContextDeep for 3-layer enhancement.
+     * Kept for backward compatibility.
+     */
+    private enrichWithGraphContext(
+        searchResults: any[],
+        codebasePath: string,
+        _existingMessage: string,
+        maxContextFiles: number = 10,
+    ): string {
+        const store = this.graphToolHandlers!.getStore();
+        const project = getRepoIdentity(codebasePath);
+        const lines: string[] = [];
+        const seenSymbols = new Set<string>();
+
+        // Collect all unique file paths from search results
+        const seenFiles = new Set<string>();
+        for (const result of searchResults.slice(0, maxContextFiles)) {
+            seenFiles.add(result.relativePath);
+        }
+
+        // For each file, find containing functions and enrich
+        for (const filePath of seenFiles) {
+            // Normalize path: strip leading slash and prefix for exact match
+            const normalizedPath = filePath.replace(/^\/+/, '');
+            let nodeResult = store.findNodes({
+                project,
+                exactFilePath: normalizedPath,
+                limit: 20,
+            });
+
+            // Fallback: try without exact path match if nothing found
+            if (nodeResult.results.length === 0 && normalizedPath !== filePath) {
+                nodeResult = store.findNodes({
+                    project,
+                    exactFilePath: filePath,
+                    limit: 20,
+                });
+            }
+
+            if (nodeResult.results.length === 0) continue;
+
+            for (const r of nodeResult.results) {
+                const n = r.node;
+                const key = n.qualifiedName;
+                if (seenSymbols.has(key)) continue;
+                seenSymbols.add(key);
+
+                // Get callers and callees
+                const callerEdges = store.getEdgesByTarget(n.id, 'CALLS');
+                const calleeEdges = store.getEdgesBySource(n.id, 'CALLS');
+
+                const callerNames = callerEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
+                    const caller = store.getNodeById(e.sourceId);
+                    return caller ? caller.name : '?';
+                });
+                const calleeNames = calleeEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
+                    const callee = store.getNodeById(e.targetId);
+                    return callee ? callee.name : '?';
+                });
+
+                // Build a compact line
+                let line = `${n.label} \`${n.name}\``;
+                if (callerNames.length > 0) {
+                    line += ` ← ${callerNames.join(', ')}`;
+                    if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
+                }
+                if (calleeNames.length > 0) {
+                    line += ` → ${calleeNames.join(', ')}`;
+                    if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
+                }
+                // Dead code detection
+                if (callerEdges.length === 0 && calleeEdges.length === 0) {
+                    line += ` [unused]`;
+                } else if (callerEdges.length === 0 && n.label === 'Function') {
+                    line += ` [entry]`;
+                }
+                line += ` (${n.filePath}:${n.startLine})`;
+
+                lines.push(line);
+            }
+        }
+
+        if (lines.length === 0) return '';
+
+        return `\n\n## Related Graph Context\n` + lines.map(l => `  - ${l}`).join('\n');
     }
 } 

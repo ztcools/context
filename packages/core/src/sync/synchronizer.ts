@@ -1,9 +1,12 @@
 import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { execSync } from 'child_process';
 import { MerkleDAG } from './merkle';
 import * as os from 'os';
 import { getRepoIdentity } from '../utils/git-identity';
+import { matchGlob } from '../utils/glob-matcher';
 
 export class FileSynchronizer {
     private fileHashes: Map<string, string>;
@@ -25,7 +28,15 @@ export class FileSynchronizer {
     private getSnapshotPath(codebasePath: string): string {
         const homeDir = os.homedir();
         const merkleDir = path.join(homeDir, '.context', 'merkle');
-        const identity = getRepoIdentity(codebasePath);
+        let identity: string;
+        try {
+            identity = getRepoIdentity(codebasePath);
+        } catch {
+            // Fallback to path-based identity if git is not available
+            const hash = crypto.createHash('md5').update(codebasePath).digest('hex');
+            identity = `path:${hash}`;
+            console.warn(`[Synchronizer] Git identity unavailable, using path-based fallback: ${identity}`);
+        }
         const hash = crypto.createHash('md5').update(identity).digest('hex');
         return path.join(merkleDir, `${hash}.json`);
     }
@@ -41,6 +52,40 @@ export class FileSynchronizer {
     }
 
     private async generateFileHashes(dir: string): Promise<Map<string, string>> {
+        const fileHashes = new Map<string, string>();
+
+        // Try git ls-files first — respects .gitignore and is much faster
+        let files: string[] = [];
+        try {
+            if (this.supportedExtensions.length === 0) {
+                return fileHashes;
+            }
+            const extPatterns = this.supportedExtensions.map((e) => `"*${e}"`).join(' ');
+            const output = execSync(
+                `git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns}`,
+                { encoding: 'utf-8', timeout: 10_000, maxBuffer: 10 * 1024 * 1024 }
+            );
+            files = output.trim().split('\n').filter(Boolean).map(f => path.join(dir, f));
+        } catch {
+            // Fallback: filesystem walk
+            return await this.generateFileHashesFromFS(dir);
+        }
+
+        for (const fullPath of files) {
+            if (!fsSync.existsSync(fullPath)) continue;
+            const relativePath = path.relative(this.rootDir, fullPath).replace(/\\/g, '/');
+            if (this.shouldIgnore(relativePath)) continue;
+            try {
+                const hash = await this.hashFile(fullPath);
+                fileHashes.set(relativePath, hash);
+            } catch (error: any) {
+                console.warn(`[Synchronizer] Cannot hash file ${relativePath}: ${error.message}`);
+            }
+        }
+        return fileHashes;
+    }
+
+    private async generateFileHashesFromFS(dir: string): Promise<Map<string, string>> {
         const fileHashes = new Map<string, string>();
 
         let entries;
@@ -120,7 +165,7 @@ export class FileSynchronizer {
 
         // Check direct pattern matches first
         for (const pattern of this.ignorePatterns) {
-            if (this.matchPattern(normalizedPath, pattern)) {
+            if (matchGlob(normalizedPath, pattern)) {
                 return true;
             }
         }
@@ -130,75 +175,13 @@ export class FileSynchronizer {
         for (let i = 0; i < normalizedPathParts.length; i++) {
             const partialPath = normalizedPathParts.slice(0, i + 1).join('/');
             for (const pattern of this.ignorePatterns) {
-                if (this.matchPattern(partialPath, pattern)) {
+                if (matchGlob(partialPath, pattern)) {
                     return true;
                 }
             }
         }
 
         return false;
-    }
-
-    private matchPattern(filePath: string, pattern: string): boolean {
-        // Clean both path and pattern
-        const cleanPath = filePath.replace(/^\/+|\/+$/g, '');
-        const normalizedPattern = pattern.replace(/\\/g, '/');
-        const cleanPattern = normalizedPattern.replace(/^\/+|\/+$/g, '');
-        const isRootAnchored = normalizedPattern.startsWith('/');
-        const isDirectoryPattern = normalizedPattern.endsWith('/');
-
-        if (!cleanPath || !cleanPattern) {
-            return false;
-        }
-
-        // Handle directory patterns (ending with /)
-        if (isDirectoryPattern) {
-            if (isRootAnchored) {
-                return this.simpleGlobMatch(cleanPath, cleanPattern) ||
-                    cleanPath.startsWith(`${cleanPattern}/`);
-            }
-
-            return this.matchesDirectoryPattern(cleanPath, cleanPattern);
-        }
-
-        if (isRootAnchored) {
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        }
-
-        // Handle path patterns (containing /)
-        if (cleanPattern.includes('/')) {
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        }
-
-        // Handle filename patterns (no /) - match against basename
-        const fileName = path.basename(cleanPath);
-        return this.simpleGlobMatch(fileName, cleanPattern);
-    }
-
-    private matchesDirectoryPattern(filePath: string, dirPattern: string): boolean {
-        const pathParts = filePath.split('/');
-        const dirPartCount = dirPattern.split('/').length;
-
-        for (let i = 0; i <= pathParts.length - dirPartCount; i++) {
-            const candidate = pathParts.slice(i, i + dirPartCount).join('/');
-            if (this.simpleGlobMatch(candidate, dirPattern)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private simpleGlobMatch(text: string, pattern: string): boolean {
-        if (!text || !pattern) return false;
-
-        // Convert glob pattern to regex
-        const regexPattern = pattern
-            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
-            .replace(/\*/g, '.*'); // Convert * to .*
-
-        const regex = new RegExp(`^${regexPattern}$`);
-        return regex.test(text);
     }
 
     private buildMerkleDAG(fileHashes: Map<string, string>): MerkleDAG {

@@ -59,10 +59,10 @@ function getBackgroundSyncIntervalMs(): number {
 export class SyncManager {
     private context: Context;
     private snapshotManager: SnapshotManager;
-    private isSyncing: boolean = false;
     private syncLockToken: string | null = null;
     private triggerWatcher: fs.FSWatcher | null = null;
     private triggerDebounceTimer: NodeJS.Timeout | null = null;
+    private syncInterval: NodeJS.Timeout | null = null;
 
     constructor(context: Context, snapshotManager: SnapshotManager) {
         this.context = context;
@@ -169,26 +169,29 @@ export class SyncManager {
 
         console.log(`[SYNC-DEBUG] Found ${indexedCodebases.length} indexed codebases:`, indexedCodebases);
 
-        if (this.isSyncing) {
-            console.log('[SYNC-DEBUG] Index sync already in progress. Skipping.');
-            return;
-        }
-
         if (!this.acquireGlobalSyncLock()) {
             return;
         }
 
-        this.isSyncing = true;
         console.log(`[SYNC-DEBUG] Starting index sync for all ${indexedCodebases.length} codebases...`);
 
         try {
             let totalStats = { added: 0, removed: 0, modified: 0 };
 
             for (let i = 0; i < indexedCodebases.length; i++) {
-                const codebasePath = indexedCodebases[i];
+                const identity = indexedCodebases[i];
+                const codebaseInfo = this.snapshotManager.getCodebaseInfoByIdentity(identity);
+                const codebasePath = codebaseInfo?.localPath;
                 const codebaseStartTime = Date.now();
 
-                console.log(`[SYNC-DEBUG] [${i + 1}/${indexedCodebases.length}] Starting sync for codebase: '${codebasePath}'`);
+                console.log(`[SYNC-DEBUG] [${i + 1}/${indexedCodebases.length}] Starting sync for codebase: '${identity}' (localPath: ${codebasePath || 'N/A'})`);
+
+                // getIndexedCodebases() returns identities, not filesystem paths.
+                // Skip if we can't resolve the localPath from codebaseInfoMap.
+                if (!codebasePath) {
+                    console.warn(`[SYNC-DEBUG] No localPath found for identity '${identity}'. Skipping sync.`);
+                    continue;
+                }
 
                 // Check if codebase path still exists
                 try {
@@ -206,7 +209,6 @@ export class SyncManager {
 
                 try {
                     console.log(`[SYNC-DEBUG] Calling context.reindexByChange() for '${codebasePath}'`);
-                    const codebaseInfo = this.snapshotManager.getCodebaseInfo(codebasePath);
                     const requestSplitterType: RequestSplitterType = resolveRequestSplitterType(codebaseInfo?.requestSplitter);
                     const requestIgnorePatterns = codebaseInfo?.requestIgnorePatterns || [];
                     const requestCustomExtensions = codebaseInfo?.requestCustomExtensions || [];
@@ -263,7 +265,6 @@ export class SyncManager {
             console.error(`[SYNC-DEBUG] Error during index sync after ${totalElapsed}ms:`, error);
             console.error(`[SYNC-DEBUG] Error stack:`, error.stack);
         } finally {
-            this.isSyncing = false;
             this.releaseGlobalSyncLock();
             const totalElapsed = Date.now() - syncStartTime;
             console.log(`[SYNC-DEBUG] handleSyncIndex() finished at ${new Date().toISOString()}, total duration: ${totalElapsed}ms`);
@@ -302,12 +303,25 @@ export class SyncManager {
 
         // Periodically check for file changes and update the index
         console.log(`[SYNC-DEBUG] Setting up periodic sync every ${syncIntervalMs}ms`);
-        const syncInterval = setInterval(() => {
+        this.syncInterval = setInterval(() => {
             console.log('[SYNC-DEBUG] Executing scheduled periodic sync');
-            this.handleSyncIndex();
+            this.handleSyncIndex().catch(err => {
+                console.error('[SYNC-DEBUG] Unhandled error in periodic sync:', err);
+            });
         }, syncIntervalMs);
 
-        console.log('[SYNC-DEBUG] Background sync setup complete. Interval ID:', syncInterval);
+        console.log('[SYNC-DEBUG] Background sync setup complete. Interval ID:', this.syncInterval);
+    }
+
+    /**
+     * Stop the background sync interval. Safe to call multiple times.
+     */
+    public stopBackgroundSync(): void {
+        if (this.syncInterval) {
+            clearInterval(this.syncInterval);
+            this.syncInterval = null;
+            console.log('[SYNC-DEBUG] Background sync stopped.');
+        }
     }
 
     /**

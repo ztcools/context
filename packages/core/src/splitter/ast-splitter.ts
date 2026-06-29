@@ -1,16 +1,37 @@
 import Parser from 'tree-sitter';
 import { Splitter, CodeChunk } from './index';
 
-// Language parsers
-const JavaScript = require('tree-sitter-javascript');
-const TypeScript = require('tree-sitter-typescript').typescript;
-const Python = require('tree-sitter-python');
-const Java = require('tree-sitter-java');
-const Cpp = require('tree-sitter-cpp');
-const Go = require('tree-sitter-go');
-const Rust = require('tree-sitter-rust');
-const CSharp = require('tree-sitter-c-sharp');
-const Scala = require('tree-sitter-scala');
+// Lazy-load language parsers with fallback — any single parser failure
+// won't prevent the module from loading other languages.
+function loadParser(name: string): any {
+    try {
+        switch (name) {
+            case 'javascript':
+                return require('tree-sitter-javascript');
+            case 'typescript':
+                return require('tree-sitter-typescript').typescript;
+            case 'python':
+                return require('tree-sitter-python');
+            case 'java':
+                return require('tree-sitter-java');
+            case 'cpp':
+                return require('tree-sitter-cpp');
+            case 'go':
+                return require('tree-sitter-go');
+            case 'rust':
+                return require('tree-sitter-rust');
+            case 'csharp':
+                return require('tree-sitter-c-sharp');
+            case 'scala':
+                return require('tree-sitter-scala');
+            default:
+                return null;
+        }
+    } catch (e: any) {
+        console.warn(`[ASTSplitter] Failed to load tree-sitter parser for '${name}': ${e.message}`);
+        return null;
+    }
+}
 
 // Node types that represent logical code units
 const SPLITTABLE_NODE_TYPES = {
@@ -84,26 +105,30 @@ export class AstCodeSplitter implements Splitter {
     }
 
     private getLanguageConfig(language: string): { parser: any; nodeTypes: string[] } | null {
-        const langMap: Record<string, { parser: any; nodeTypes: string[] }> = {
-            'javascript': { parser: JavaScript, nodeTypes: SPLITTABLE_NODE_TYPES.javascript },
-            'js': { parser: JavaScript, nodeTypes: SPLITTABLE_NODE_TYPES.javascript },
-            'typescript': { parser: TypeScript, nodeTypes: SPLITTABLE_NODE_TYPES.typescript },
-            'ts': { parser: TypeScript, nodeTypes: SPLITTABLE_NODE_TYPES.typescript },
-            'python': { parser: Python, nodeTypes: SPLITTABLE_NODE_TYPES.python },
-            'py': { parser: Python, nodeTypes: SPLITTABLE_NODE_TYPES.python },
-            'java': { parser: Java, nodeTypes: SPLITTABLE_NODE_TYPES.java },
-            'cpp': { parser: Cpp, nodeTypes: SPLITTABLE_NODE_TYPES.cpp },
-            'c++': { parser: Cpp, nodeTypes: SPLITTABLE_NODE_TYPES.cpp },
-            'c': { parser: Cpp, nodeTypes: SPLITTABLE_NODE_TYPES.cpp },
-            'go': { parser: Go, nodeTypes: SPLITTABLE_NODE_TYPES.go },
-            'rust': { parser: Rust, nodeTypes: SPLITTABLE_NODE_TYPES.rust },
-            'rs': { parser: Rust, nodeTypes: SPLITTABLE_NODE_TYPES.rust },
-            'cs': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
-            'csharp': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
-            'scala': { parser: Scala, nodeTypes: SPLITTABLE_NODE_TYPES.scala }
+        const langMap: Record<string, () => { parser: any; nodeTypes: string[] }> = {
+            'javascript': () => ({ parser: loadParser('javascript'), nodeTypes: SPLITTABLE_NODE_TYPES.javascript }),
+            'js': () => ({ parser: loadParser('javascript'), nodeTypes: SPLITTABLE_NODE_TYPES.javascript }),
+            'typescript': () => ({ parser: loadParser('typescript'), nodeTypes: SPLITTABLE_NODE_TYPES.typescript }),
+            'ts': () => ({ parser: loadParser('typescript'), nodeTypes: SPLITTABLE_NODE_TYPES.typescript }),
+            'python': () => ({ parser: loadParser('python'), nodeTypes: SPLITTABLE_NODE_TYPES.python }),
+            'py': () => ({ parser: loadParser('python'), nodeTypes: SPLITTABLE_NODE_TYPES.python }),
+            'java': () => ({ parser: loadParser('java'), nodeTypes: SPLITTABLE_NODE_TYPES.java }),
+            'cpp': () => ({ parser: loadParser('cpp'), nodeTypes: SPLITTABLE_NODE_TYPES.cpp }),
+            'c++': () => ({ parser: loadParser('cpp'), nodeTypes: SPLITTABLE_NODE_TYPES.cpp }),
+            'c': () => ({ parser: loadParser('cpp'), nodeTypes: SPLITTABLE_NODE_TYPES.cpp }),
+            'go': () => ({ parser: loadParser('go'), nodeTypes: SPLITTABLE_NODE_TYPES.go }),
+            'rust': () => ({ parser: loadParser('rust'), nodeTypes: SPLITTABLE_NODE_TYPES.rust }),
+            'rs': () => ({ parser: loadParser('rust'), nodeTypes: SPLITTABLE_NODE_TYPES.rust }),
+            'cs': () => ({ parser: loadParser('csharp'), nodeTypes: SPLITTABLE_NODE_TYPES.csharp }),
+            'csharp': () => ({ parser: loadParser('csharp'), nodeTypes: SPLITTABLE_NODE_TYPES.csharp }),
+            'scala': () => ({ parser: loadParser('scala'), nodeTypes: SPLITTABLE_NODE_TYPES.scala })
         };
 
-        return langMap[language.toLowerCase()] || null;
+        const factory = langMap[language.toLowerCase()];
+        if (!factory) return null;
+        const config = factory();
+        if (!config.parser) return null;
+        return config;
     }
 
     private extractChunks(
@@ -266,5 +291,15 @@ export class AstCodeSplitter implements Splitter {
             'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala'
         ];
         return supportedLanguages.includes(language.toLowerCase());
+    }
+
+    /**
+     * Get list of supported languages
+     */
+    static getSupportedLanguages(): string[] {
+        return [
+            'javascript', 'js', 'typescript', 'ts', 'python', 'py',
+            'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala'
+        ];
     }
 }

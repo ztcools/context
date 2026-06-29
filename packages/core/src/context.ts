@@ -20,9 +20,12 @@ import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import * as crypto from 'crypto';
+import { execSync } from 'child_process';
 import { FileSynchronizer } from './sync/synchronizer';
 import { getRepoIdentity } from './utils/git-identity';
+import { matchGlob } from './utils/glob-matcher';
 
 /**
  * Thrown by indexCodebase / processFileList when an AbortSignal fires
@@ -89,6 +92,15 @@ const DEFAULT_IGNORE_PATTERNS = [
     '.cache/**',
     '__pycache__/**',
     '.pytest_cache/**',
+    '.next/**',
+    '.nuxt/**',
+    '.turbo/**',
+    '.parcel-cache/**',
+    '.terraform/**',
+
+    // Dependency directories
+    'vendor/**',
+    'bower_components/**',
 
     // Logs and temporary files
     'logs/**',
@@ -144,10 +156,14 @@ export class Context {
     constructor(config: ContextConfig = {}) {
         // Initialize services
         this.embedding = config.embedding || new OpenAIEmbedding({
-            apiKey: envManager.get('OPENAI_API_KEY') || 'your-openai-api-key',
+            apiKey: envManager.get('OPENAI_API_KEY') || 'missing-openai-api-key',
             model: 'text-embedding-3-small',
             ...(envManager.get('OPENAI_BASE_URL') && { baseURL: envManager.get('OPENAI_BASE_URL') })
         });
+
+        if (!config.embedding && !envManager.get('OPENAI_API_KEY')) {
+            console.warn('[Context] No OPENAI_API_KEY found in environment. Embedding operations will fail.');
+        }
 
         if (!config.vectorDatabase) {
             throw new Error('VectorDatabase is required. Please provide a vectorDatabase instance in the config.');
@@ -783,15 +799,17 @@ export class Context {
             return;
         }
 
+        // Detect dimension BEFORE dropping the old collection to avoid data loss
+        // if dimension detection fails (e.g. invalid API key, network error)
+        console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
+        const dimension = await this.embedding.detectDimension();
+        console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
+
         if (collectionExists && forceReindex) {
             console.log(`[Context] 🗑️  Dropping existing collection ${collectionName} for force reindex...`);
             await this.vectorDatabase.dropCollection(collectionName);
             console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
         }
-
-        console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
-        const dimension = await this.embedding.detectDimension();
-        console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
         const repoIdentity = getRepoIdentity(codebasePath);
 
         if (isHybrid === true) {
@@ -813,6 +831,27 @@ export class Context {
     ): Promise<string[]> {
         const files: string[] = [];
 
+        // Try git ls-files first — respects .gitignore and is much faster
+        try {
+            const extPatterns = supportedExtensions.map((e) => `"*${e}"`).join(' ');
+            const output = execSync(`git -C "${codebasePath}" ls-files --cached --others --exclude-standard -- ${extPatterns}`, {
+                encoding: 'utf-8',
+                timeout: 10_000,
+                maxBuffer: 10 * 1024 * 1024,
+            });
+            const lines = output.trim().split('\n').filter(Boolean);
+            for (const line of lines) {
+                const fullPath = path.join(codebasePath, line);
+                if (fs.existsSync(fullPath)) {
+                    files.push(fullPath);
+                }
+            }
+            return files;
+        } catch {
+            // Fallback: filesystem walk with ignore patterns
+        }
+
+        // Fallback filesystem walk
         const traverseDirectory = async (currentPath: string) => {
             const entries = await fs.promises.readdir(currentPath, { withFileTypes: true });
 
@@ -893,7 +932,7 @@ export class Context {
                     // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
                         try {
-                            await this.processChunkBuffer(chunkBuffer);
+                            await this.processChunkBuffer(chunkBuffer, signal);
                         } catch (error) {
                             // Embedding errors (such as API having no quota) halt the entire indexing process and propagate upwards.
                             if (error instanceof EmbeddingError) {
@@ -905,6 +944,9 @@ export class Context {
                                 console.error('[Context] Stack trace:', error.stack);
                             }
                         } finally {
+                            if (chunkBuffer.length > 0) {
+                                console.warn(`[Context] Discarding ${chunkBuffer.length} chunks due to batch processing failure`);
+                            }
                             chunkBuffer = []; // Always clear buffer, even on failure
                         }
                     }
@@ -937,7 +979,7 @@ export class Context {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
             console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
             try {
-                await this.processChunkBuffer(chunkBuffer);
+                await this.processChunkBuffer(chunkBuffer, signal);
             } catch (error) {
                 if (error instanceof EmbeddingError) {
                     throw error;
@@ -963,8 +1005,12 @@ export class Context {
     /**
  * Process accumulated chunk buffer
  */
-    private async processChunkBuffer(chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>): Promise<void> {
+    private async processChunkBuffer(
+        chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>,
+        signal?: AbortSignal
+    ): Promise<void> {
         if (chunkBuffer.length === 0) return;
+        if (signal?.aborted) return;
 
         // Extract chunks and ensure they all have the same codebasePath
         const chunks = chunkBuffer.map(item => item.chunk);
@@ -1124,7 +1170,9 @@ export class Context {
             '.mm': 'objective-c',
             '.dart': 'dart',
             '.sol': 'solidity',
-            '.ipynb': 'jupyter'
+            '.ipynb': 'jupyter',
+            '.md': 'markdown',
+            '.markdown': 'markdown',
         };
         return languageMap[ext] || 'text';
     }
@@ -1247,7 +1295,7 @@ export class Context {
      */
     private async loadGlobalIgnoreFile(): Promise<string[]> {
         try {
-            const homeDir = require('os').homedir();
+            const homeDir = os.homedir();
             const globalIgnorePath = path.join(homeDir, '.context', '.contextignore');
             return await this.loadIgnoreFile(globalIgnorePath, 'global .contextignore');
         } catch (error) {
@@ -1308,84 +1356,12 @@ export class Context {
         const normalizedPath = relativePath.replace(/\\/g, '/'); // Normalize path separators
 
         for (const pattern of ignorePatterns) {
-            if (this.isPatternMatch(normalizedPath, pattern)) {
+            if (matchGlob(normalizedPath, pattern)) {
                 return true;
             }
         }
 
         return false;
-    }
-
-    /**
-     * Simple glob pattern matching
-     * @param filePath File path to test
-     * @param pattern Glob pattern
-     * @returns True if pattern matches
-     */
-    private isPatternMatch(filePath: string, pattern: string): boolean {
-        const cleanPath = filePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-        const normalizedPattern = pattern.replace(/\\/g, '/');
-        const cleanPattern = normalizedPattern.replace(/^\/+|\/+$/g, '');
-        const isRootAnchored = normalizedPattern.startsWith('/');
-        const isDirectoryPattern = normalizedPattern.endsWith('/');
-
-        if (!cleanPath || !cleanPattern) {
-            return false;
-        }
-
-        // Handle directory patterns (ending with /)
-        if (isDirectoryPattern) {
-            if (isRootAnchored) {
-                return this.simpleGlobMatch(cleanPath, cleanPattern) ||
-                    cleanPath.startsWith(`${cleanPattern}/`);
-            }
-
-            return this.matchesDirectoryPattern(cleanPath, cleanPattern);
-        }
-
-        if (isRootAnchored) {
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        }
-
-        // Handle file patterns
-        if (cleanPattern.includes('/')) {
-            // Pattern with path separator - match exact path
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        } else {
-            // Pattern without path separator - match filename in any directory
-            const fileName = path.basename(cleanPath);
-            return this.simpleGlobMatch(fileName, cleanPattern);
-        }
-    }
-
-    private matchesDirectoryPattern(filePath: string, dirPattern: string): boolean {
-        const pathParts = filePath.split('/');
-        const dirPartCount = dirPattern.split('/').length;
-
-        for (let i = 0; i <= pathParts.length - dirPartCount; i++) {
-            const candidate = pathParts.slice(i, i + dirPartCount).join('/');
-            if (this.simpleGlobMatch(candidate, dirPattern)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Simple glob matching supporting * wildcard
-     * @param text Text to test
-     * @param pattern Pattern with * wildcards
-     * @returns True if pattern matches
-     */
-    private simpleGlobMatch(text: string, pattern: string): boolean {
-        // Convert glob pattern to regex
-        const regexPattern = pattern
-            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
-            .replace(/\*/g, '.*'); // Convert * to .*
-
-        const regex = new RegExp(`^${regexPattern}$`);
-        return regex.test(text);
     }
 
     private dedupePatterns(patterns: string[]): string[] {
@@ -1471,7 +1447,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             return {
                 type: 'ast',
                 hasBuiltinFallback: true,
@@ -1493,7 +1468,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             return AstCodeSplitter.isLanguageSupported(language);
         }
 
@@ -1509,7 +1483,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             const isSupported = AstCodeSplitter.isLanguageSupported(language);
 
             return {

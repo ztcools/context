@@ -21,6 +21,9 @@ export class SnapshotManager {
     private codebaseInfoMap: Map<string, CodebaseInfo> = new Map(); // identity -> CodebaseInfo
     private recentlyRemoved: Set<string> = new Set(); // identities removed since last save
     private identityCache: Map<string, string> = new Map(); // codebasePath -> identity
+    /** Short-lived cache for snapshot file reads to avoid repeated I/O in same call chain */
+    private snapshotCache: { data: CodebaseSnapshot | null; timestamp: number } | null = null;
+    private static SNAPSHOT_CACHE_TTL_MS = 5_000;
 
     constructor() {
         // Initialize snapshot file path
@@ -30,6 +33,7 @@ export class SnapshotManager {
     /**
      * Resolve identity from codebase path. All internal state is keyed by identity.
      * Results are cached per path to avoid repeated git calls.
+     * Cache is cleared on each snapshot load to prevent stale identities.
      */
     private toIdentity(codebasePath: string): string {
         // If the input already looks like an identity (contains URI scheme or git@),
@@ -42,6 +46,14 @@ export class SnapshotManager {
             this.identityCache.set(resolved, getRepoIdentity(resolved));
         }
         return this.identityCache.get(resolved)!;
+    }
+
+    /**
+     * Clear the identity cache. Should be called before snapshot load to ensure
+     * fresh identities are resolved (e.g., after remote URL or branch changes).
+     */
+    clearIdentityCache(): void {
+        this.identityCache.clear();
     }
 
     /**
@@ -170,58 +182,132 @@ export class SnapshotManager {
         this.codebaseInfoMap = validCodebaseInfoMap;
     }
 
-    public getIndexedCodebases(): string[] {
-        // Read from JSON file to ensure consistency and persistence.
-        // Convert old-format keys (filesystem paths) to identities on the fly.
+    /**
+     * Read the snapshot file with a short-lived cache to avoid repeated I/O
+     * within the same call chain (e.g. syncIndexedCodebasesFromCloud calls
+     * getIndexedCodebases multiple times).
+     */
+    private readSnapshotCached(): CodebaseSnapshot | null {
+        const now = Date.now();
+        if (this.snapshotCache && (now - this.snapshotCache.timestamp) < SnapshotManager.SNAPSHOT_CACHE_TTL_MS) {
+            return this.snapshotCache.data;
+        }
         try {
             if (!fs.existsSync(this.snapshotFilePath)) {
-                return [];
+                this.snapshotCache = { data: null, timestamp: now };
+                return null;
             }
-
-            const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
-            const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
-
-            if (this.isV2Format(snapshot)) {
-                return Object.entries(snapshot.codebases)
-                    .filter(([_, info]) => info.status === 'indexed')
-                    .map(([key, _]) => (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key);
-            } else {
-                // V1 format: keys are filesystem paths, convert to identities
-                const indexed = snapshot.indexedCodebases || [];
-                return indexed.map((p: string) => this.toIdentity(p));
-            }
+            const data = fs.readFileSync(this.snapshotFilePath, 'utf8');
+            const snapshot: CodebaseSnapshot = JSON.parse(data);
+            this.snapshotCache = { data: snapshot, timestamp: now };
+            return snapshot;
         } catch (error) {
-            console.warn(`[SNAPSHOT-DEBUG] Error reading indexed codebases from file:`, error);
-            return [...this.indexedCodebases];
+            console.warn(`[SNAPSHOT-DEBUG] Error reading snapshot file:`, error);
+            this.snapshotCache = { data: null, timestamp: now };
+            return null;
         }
     }
 
-    public getIndexingCodebases(): string[] {
-        try {
-            if (!fs.existsSync(this.snapshotFilePath)) {
-                return [];
-            }
+    /** Invalidate snapshot cache (call after save or load). */
+    private invalidateSnapshotCache(): void {
+        this.snapshotCache = null;
+    }
 
-            const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
-            const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
+    public getIndexedCodebases(): string[] {
+        // Merge file-based identities with in-memory state.
+        // File may be stale (read-only FS, cross-process writes), so always
+        // include in-memory entries that may have been added since last save.
+        // IMPORTANT: in-memory state overrides file — if a codebase is "indexing"
+        // in memory, it must NOT appear in the "indexed" list even if the stale
+        // file still says "indexed". Otherwise syncIndexedCodebasesFromCloud
+        // will removeCodebaseCompletely() and wipe the in-memory indexing state.
+        const result = new Set<string>();
 
+        // Add in-memory indexed entries first (most authoritative)
+        for (const id of this.indexedCodebases) {
+            result.add(id);
+        }
+
+        // Add file entries, but only if the in-memory codebaseInfoMap doesn't
+        // have a conflicting status (e.g. "indexing" that should override)
+        const snapshot = this.readSnapshotCached();
+        if (snapshot) {
             if (this.isV2Format(snapshot)) {
-                return Object.entries(snapshot.codebases)
-                    .filter(([_, info]) => info.status === 'indexing')
-                    .map(([key, _]) => (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key);
+                for (const [key, info] of Object.entries(snapshot.codebases)) {
+                    if (info.status === 'indexed') {
+                        const id = (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key;
+                        // Only include if in-memory doesn't have a conflicting status
+                        const memInfo = this.codebaseInfoMap.get(id);
+                        if (!memInfo || memInfo.status === 'indexed') {
+                            result.add(id);
+                        }
+                    }
+                }
             } else {
-                if (Array.isArray(snapshot.indexingCodebases)) {
-                    return snapshot.indexingCodebases.map((p: string) => this.toIdentity(p));
-                } else if (snapshot.indexingCodebases && typeof snapshot.indexingCodebases === 'object') {
-                    return Object.keys(snapshot.indexingCodebases).map((p: string) => this.toIdentity(p));
+                const indexed = snapshot.indexedCodebases || [];
+                for (const p of indexed) {
+                    const id = this.toIdentity(p);
+                    const memInfo = this.codebaseInfoMap.get(id);
+                    if (!memInfo || memInfo.status === 'indexed') {
+                        result.add(id);
+                    }
                 }
             }
-
-            return [];
-        } catch (error) {
-            console.warn(`[SNAPSHOT-DEBUG] Error reading indexing codebases from file:`, error);
-            return Array.from(this.indexingCodebases.keys());
         }
+
+        return Array.from(result);
+    }
+
+    public getIndexingCodebases(): string[] {
+        // Merge file-based identities with in-memory state.
+        // File may be stale (read-only FS, cross-process writes), so always
+        // include in-memory entries that may have been added since last save.
+        // IMPORTANT: in-memory state overrides file — if a codebase is "indexed"
+        // in memory, it must NOT appear in the "indexing" list even if the stale
+        // file still says "indexing".
+        const result = new Set<string>();
+
+        // Add in-memory indexing entries first (most authoritative)
+        for (const id of this.indexingCodebases.keys()) {
+            result.add(id);
+        }
+
+        // Add file entries, but only if the in-memory codebaseInfoMap doesn't
+        // have a conflicting status (e.g. "indexed" that should override)
+        const snapshot = this.readSnapshotCached();
+        if (snapshot) {
+            if (this.isV2Format(snapshot)) {
+                for (const [key, info] of Object.entries(snapshot.codebases)) {
+                    if (info.status === 'indexing') {
+                        const id = (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key;
+                        const memInfo = this.codebaseInfoMap.get(id);
+                        if (!memInfo || memInfo.status === 'indexing') {
+                            result.add(id);
+                        }
+                    }
+                }
+            } else {
+                if (Array.isArray(snapshot.indexingCodebases)) {
+                    for (const p of snapshot.indexingCodebases) {
+                        const id = this.toIdentity(p);
+                        const memInfo = this.codebaseInfoMap.get(id);
+                        if (!memInfo || memInfo.status === 'indexing') {
+                            result.add(id);
+                        }
+                    }
+                } else if (snapshot.indexingCodebases && typeof snapshot.indexingCodebases === 'object') {
+                    for (const p of Object.keys(snapshot.indexingCodebases)) {
+                        const id = this.toIdentity(p);
+                        const memInfo = this.codebaseInfoMap.get(id);
+                        if (!memInfo || memInfo.status === 'indexing') {
+                            result.add(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        return Array.from(result);
     }
 
     /**
@@ -273,13 +359,6 @@ export class SnapshotManager {
         return this.getIndexOptions(options ?? this.codebaseInfoMap.get(identity));
     }
 
-    /**
-     * @deprecated Use getCodebaseInfo() for individual codebases or iterate through codebases for v2 format support
-     */
-    public getIndexingCodebasesWithProgress(): Map<string, number> {
-        return new Map(this.indexingCodebases);
-    }
-
     public getIndexingProgress(codebasePath: string): number | undefined {
         const identity = this.toIdentity(codebasePath);
         try {
@@ -310,104 +389,6 @@ export class SnapshotManager {
             console.warn(`[SNAPSHOT-DEBUG] Error reading progress from file for ${codebasePath}:`, error);
             return this.indexingCodebases.get(identity);
         }
-    }
-
-    /**
-     * @deprecated Use setCodebaseIndexing() instead for v2 format support
-     */
-    public addIndexingCodebase(codebasePath: string, progress: number = 0): void {
-        const identity = this.toIdentity(codebasePath);
-        this.indexingCodebases.set(identity, progress);
-
-        const info: CodebaseInfoIndexing = {
-            status: 'indexing',
-            localPath: codebasePath,
-            indexingPercentage: progress,
-            lastUpdated: new Date().toISOString()
-        };
-        this.codebaseInfoMap.set(identity, info);
-    }
-
-    /**
-     * @deprecated Use setCodebaseIndexing() instead for v2 format support
-     */
-    public updateIndexingProgress(codebasePath: string, progress: number): void {
-        const identity = this.toIdentity(codebasePath);
-        if (this.indexingCodebases.has(identity)) {
-            this.indexingCodebases.set(identity, progress);
-
-            const info: CodebaseInfoIndexing = {
-                status: 'indexing',
-                localPath: codebasePath,
-                indexingPercentage: progress,
-                lastUpdated: new Date().toISOString()
-            };
-            this.codebaseInfoMap.set(identity, info);
-        }
-    }
-
-    /**
-     * @deprecated Use removeCodebaseCompletely() or state-specific methods instead for v2 format support
-     */
-    public removeIndexingCodebase(codebasePath: string): void {
-        const identity = this.toIdentity(codebasePath);
-        this.indexingCodebases.delete(identity);
-        this.codebaseInfoMap.delete(identity);
-    }
-
-    /**
-     * @deprecated Use setCodebaseIndexed() instead for v2 format support
-     */
-    public addIndexedCodebase(codebasePath: string, fileCount?: number): void {
-        const identity = this.toIdentity(codebasePath);
-        if (!this.indexedCodebases.includes(identity)) {
-            this.indexedCodebases.push(identity);
-        }
-        if (fileCount !== undefined) {
-            this.codebaseFileCount.set(identity, fileCount);
-        }
-
-        const info: CodebaseInfoIndexed = {
-            status: 'indexed',
-            localPath: codebasePath,
-            indexedFiles: fileCount || 0,
-            totalChunks: 0,
-            indexStatus: 'completed',
-            lastUpdated: new Date().toISOString()
-        };
-        this.codebaseInfoMap.set(identity, info);
-    }
-
-    /**
-     * @deprecated Use removeCodebaseCompletely() or state-specific methods instead for v2 format support
-     */
-    public removeIndexedCodebase(codebasePath: string): void {
-        const identity = this.toIdentity(codebasePath);
-        this.indexedCodebases = this.indexedCodebases.filter(id => id !== identity);
-        this.codebaseFileCount.delete(identity);
-        this.codebaseInfoMap.delete(identity);
-    }
-
-    /**
-     * @deprecated Use setCodebaseIndexed() instead for v2 format support
-     */
-    public moveFromIndexingToIndexed(codebasePath: string, fileCount?: number): void {
-        this.removeIndexingCodebase(codebasePath);
-        this.addIndexedCodebase(codebasePath, fileCount);
-    }
-
-    /**
-     * @deprecated Use getCodebaseInfo() and check indexedFiles property instead for v2 format support
-     */
-    public getIndexedFileCount(codebasePath: string): number | undefined {
-        return this.codebaseFileCount.get(this.toIdentity(codebasePath));
-    }
-
-    /**
-     * @deprecated Use setCodebaseIndexed() with complete stats instead for v2 format support
-     */
-    public setIndexedFileCount(codebasePath: string, fileCount: number): void {
-        this.codebaseFileCount.set(this.toIdentity(codebasePath), fileCount);
     }
 
     /**
@@ -513,6 +494,13 @@ export class SnapshotManager {
     }
 
     /**
+     * Get codebase info by identity directly (used when iterating getIndexedCodebases())
+     */
+    public getCodebaseInfoByIdentity(identity: string): CodebaseInfo | undefined {
+        return this.codebaseInfoMap.get(identity);
+    }
+
+    /**
      * Read a codebase's info directly from the on-disk snapshot, bypassing the
      * in-memory codebaseInfoMap. Looks up by identity (computed from codebasePath)
      * and also tries the raw path for backward compatibility with old-format snapshots.
@@ -591,16 +579,33 @@ export class SnapshotManager {
      */
     public removeCodebaseCompletely(codebasePath: string): void {
         const identity = this.toIdentity(codebasePath);
+        this.removeCodebaseByIdentity(identity, codebasePath);
+    }
+
+    /**
+     * Remove a codebase by identity (url:branch) directly.
+     * Unlike removeCodebaseCompletely, this does NOT resolve the path
+     * to the current git identity — it uses the given identity as-is.
+     * This is critical when the identity is from a stale file entry
+     * whose branch no longer matches the current checkout.
+     */
+    public removeCodebaseByIdentity(identity: string, codebasePath?: string): void {
         this.indexedCodebases = this.indexedCodebases.filter(id => id !== identity);
         this.indexingCodebases.delete(identity);
         this.codebaseFileCount.delete(identity);
         this.codebaseInfoMap.delete(identity);
         this.recentlyRemoved.add(identity);
+        // Clear identity cache for this path (and any aliases)
+        if (codebasePath) {
+            const resolved = path.resolve(codebasePath);
+            this.identityCache.delete(resolved);
+        }
 
-        console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath} (identity: ${identity})`);
+        console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath || identity} (identity: ${identity})`);
     }
 
     public loadCodebaseSnapshot(): void {
+        this.invalidateSnapshotCache();
         console.log('[SNAPSHOT-DEBUG] Loading codebase snapshot from:', this.snapshotFilePath);
 
         try {
@@ -639,12 +644,14 @@ export class SnapshotManager {
                 try {
                     const stat = fs.statSync(lockPath);
                     if (Date.now() - stat.mtimeMs > 10000) {
-                        fs.rmdirSync(lockPath);
+                        fs.rmSync(lockPath, { recursive: true });
                         continue;
                     }
                 } catch { }
-                const waitUntil = Date.now() + retryInterval;
-                while (Date.now() < waitUntil) { /* busy wait */ }
+                // Use synchronous sleep via Atomics.wait for non-blocking CPU
+                const waitBuffer = new SharedArrayBuffer(4);
+                const waitArray = new Int32Array(waitBuffer);
+                Atomics.wait(waitArray, 0, 0, retryInterval);
             }
         }
         return false;
@@ -652,7 +659,7 @@ export class SnapshotManager {
 
     private releaseLock(): void {
         try {
-            fs.rmdirSync(this.snapshotFilePath + '.lock');
+            fs.rmSync(this.snapshotFilePath + '.lock', { recursive: true });
         } catch { }
     }
 
@@ -679,6 +686,7 @@ export class SnapshotManager {
     }
 
     public saveCodebaseSnapshot(): void {
+        this.invalidateSnapshotCache();
         console.log('[SNAPSHOT-DEBUG] Saving codebase snapshot to:', this.snapshotFilePath);
 
         const locked = this.acquireLock();
@@ -721,7 +729,10 @@ export class SnapshotManager {
                 lastUpdated: new Date().toISOString()
             };
 
-            fs.writeFileSync(this.snapshotFilePath, JSON.stringify(snapshot, null, 2));
+            // Atomic write: write to temp file first, then rename
+            const tmpPath = this.snapshotFilePath + '.tmp';
+            fs.writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2));
+            fs.renameSync(tmpPath, this.snapshotFilePath);
 
             this.recentlyRemoved.clear();
 

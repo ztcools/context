@@ -2,9 +2,6 @@
 
 // CRITICAL: Redirect console outputs to stderr IMMEDIATELY to avoid interfering with MCP JSON protocol
 // Only MCP protocol messages should go to stdout
-const originalConsoleLog = console.log;
-const originalConsoleWarn = console.warn;
-
 console.log = (...args: any[]) => {
     process.stderr.write('[LOG] ' + args.join(' ') + '\n');
 };
@@ -30,6 +27,7 @@ import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.j
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
+import { GraphToolHandlers } from "./graph-handlers.js";
 
 class ContextMcpServer {
     private server: Server;
@@ -37,6 +35,7 @@ class ContextMcpServer {
     private snapshotManager: SnapshotManager;
     private syncManager: SyncManager;
     private toolHandlers: ToolHandlers;
+    private graphToolHandlers: GraphToolHandlers;
 
     constructor(config: ContextMcpConfig) {
         // Initialize MCP server
@@ -75,7 +74,8 @@ class ContextMcpServer {
         // Initialize managers
         this.snapshotManager = new SnapshotManager();
         this.syncManager = new SyncManager(this.context, this.snapshotManager);
-        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
+        this.graphToolHandlers = new GraphToolHandlers();
+        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager, this.graphToolHandlers);
 
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
@@ -85,164 +85,140 @@ class ContextMcpServer {
 
     private setupTools() {
         const index_description = `
-Index a codebase directory to enable semantic search. The codebase is identified by its git remote URL + branch name (not by filesystem path), so the same repository cloned to different locations shares a single index.
+Index a codebase for intelligent code search. One call builds both vector index (Milvus) and knowledge graph (SQLite). Codebases are identified by git remote URL + branch, so team members sharing the same repo+branch reuse each other's indexes.
 
-⚠️ **IMPORTANT**:
-- The 'path' parameter accepts paths, relative paths (resolved against the current working directory), or "." to auto-detect the IDE workspace root.
-- Before indexing, the system checks if the repository (identified by git URL + branch) is already indexed in the vector database. If already indexed, indexing is skipped unless force=true.
-
-✨ **Usage Guidance**:
-- Use this tool when the user wants to index a project for semantic search.
-- If the user does not specify a path, default to "." (current workspace).
-- If the user says "index this project", "index the current workspace", or "index /path/to/project", call this tool.
-- The system isolates indexes by git URL + branch, so team members sharing the same repo+branch can reuse each other's indexes.
+⚠️ **First-time setup**: User MUST call this manually once per project. After that, incremental updates are automatic.
 `;
-
 
         const search_description = `
-Search the indexed codebase using natural language queries. The codebase is identified by its git remote URL + branch, so searches work across different local checkouts of the same repository.
+Search the indexed codebase with natural language. Returns matched code snippets enriched with graph context (callers, callees, call chains, architecture, dead code).
 
-⚠️ **IMPORTANT**:
-- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.
-- If the codebase is not yet indexed, the tool returns an error - use index_codebase first.
+🎯 **When to call** (call BEFORE reading files):
+- User asks how something works or where it's implemented
+- Before modifying code — check existing patterns
+- Debugging a bug
+- Understanding unfamiliar code or reviewing PRs
+- Refactoring — find all related code and callers
 
-🎯 **When to Use**:
-This tool is versatile and can be used before completing various tasks to retrieve relevant context:
-- **Code search**: Find specific functions, classes, or implementations
-- **Context-aware assistance**: Gather relevant code context before making changes
-- **Issue identification**: Locate problematic code sections or bugs
-- **Code review**: Understand existing implementations and patterns
-- **Refactoring**: Find all related code pieces that need to be updated
-- **Feature development**: Understand existing architecture and similar implementations
-- **Duplicate detection**: Identify redundant or duplicated code patterns across the codebase
-
-✨ **Usage Guidance**:
-- If the codebase is not indexed, this tool will return a clear error message indicating that indexing is required first.
-- You can then use the index_codebase tool to index the codebase before searching again.
+💡 Prefer search over reading files directly. One call returns the code, its call chain, and architecture context.
 `;
 
-        // Define available tools
         this.server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
-                        name: "index_codebase",
+                        name: "index",
                         description: index_description,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to index. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided. The path is only used to locate the project on disk; the index is identified by git URL + branch.`
+                                    description: "Path to the codebase directory to index. Defaults to current workspace.",
                                 },
                                 force: {
                                     type: "boolean",
                                     description: "Force re-indexing even if already indexed",
-                                    default: false
+                                    default: false,
                                 },
                                 splitter: {
                                     type: "string",
-                                    description: "Code splitter to use: 'ast' for syntax-aware splitting with automatic fallback, 'langchain' for character-based splitting",
+                                    description: "Code splitter: 'ast' (syntax-aware) or 'langchain' (character-based)",
                                     enum: ["ast", "langchain"],
-                                    default: "ast"
+                                    default: "ast",
                                 },
                                 customExtensions: {
                                     type: "array",
-                                    items: {
-                                        type: "string"
-                                    },
-                                    description: "Optional: Additional file extensions to include beyond defaults (e.g., ['.vue', '.svelte', '.astro']). Extensions should include the dot prefix or will be automatically added",
-                                    default: []
+                                    items: { type: "string" },
+                                    description: "Additional file extensions beyond defaults",
+                                    default: [],
                                 },
                                 ignorePatterns: {
                                     type: "array",
-                                    items: {
-                                        type: "string"
-                                    },
-                                    description: "Optional: Additional ignore patterns to exclude specific files/directories beyond defaults. Only include this parameter if the user explicitly requests custom ignore patterns (e.g., ['static/**', '*.tmp', 'private/**'])",
-                                    default: []
-                                }
-                            }
-                        }
+                                    items: { type: "string" },
+                                    description: "Additional ignore patterns beyond defaults",
+                                    default: [],
+                                },
+                            },
+                        },
                     },
                     {
-                        name: "search_code",
+                        name: "search",
                         description: search_description,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to search in. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                                    description: "Codebase path to search in. Defaults to current workspace.",
                                 },
                                 query: {
                                     type: "string",
-                                    description: "Natural language query to search for in the codebase"
+                                    description: "Natural language query",
                                 },
                                 limit: {
                                     type: "number",
-                                    description: "Maximum number of results to return",
+                                    description: "Max results (default 10, max 50)",
                                     default: 10,
-                                    maximum: 50
+                                    maximum: 50,
                                 },
                                 extensionFilter: {
                                     type: "array",
-                                    items: {
-                                        type: "string"
-                                    },
-                                    description: "Optional: List of file extensions to filter results. (e.g., ['.ts','.py']).",
-                                    default: []
-                                }
+                                    items: { type: "string" },
+                                    description: "Filter by file extensions (e.g. ['.ts', '.py'])",
+                                    default: [],
+                                },
                             },
-                            required: ["query"]
-                        }
+                            required: ["query"],
+                        },
                     },
                     {
-                        name: "clear_index",
-                        description: `Clear the search index. The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                        name: "clear",
+                        description: "Clear all indexes (vector + graph) for a codebase.",
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to clear. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
-                                }
-                            }
-                        }
+                                    description: "Codebase path to clear. Defaults to current workspace.",
+                                },
+                            },
+                        },
                     },
                     {
-                        name: "get_indexing_status",
-                        description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases. The codebase is identified by its git remote URL + branch, so status works across different local checkouts of the same repository.
-
-⚠️ **IMPORTANT**:
-- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
+                        name: "status",
+                        description: "Get indexing status — vector index (Milvus) and graph index (SQLite) combined.",
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `Path to the codebase directory to check status for. Accepts paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`
-                                }
-                            }
-                        }
+                                    description: "Codebase path to check. Defaults to current workspace.",
+                                },
+                            },
+                        },
                     },
-                ]
+                ],
             };
         });
 
-        // Handle tool execution
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
+            const safeArgs = args || {};
 
             switch (name) {
+                case "index":
                 case "index_codebase":
-                    return await this.toolHandlers.handleIndexCodebase(args);
+                    return await this.toolHandlers.handleIndex(args);
+                case "search":
                 case "search_code":
                     return await this.toolHandlers.handleSearchCode(args);
+                case "clear":
                 case "clear_index":
                     return await this.toolHandlers.handleClearIndex(args);
+                case "status":
                 case "get_indexing_status":
-                    return await this.toolHandlers.handleGetIndexingStatus(args);
+                    return await this.toolHandlers.handleStatus(args);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);

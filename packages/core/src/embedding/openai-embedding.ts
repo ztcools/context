@@ -11,6 +11,7 @@ export class OpenAIEmbedding extends Embedding {
     private client: OpenAI;
     private config: OpenAIEmbeddingConfig;
     private dimension: number = 1536; // Default dimension for text-embedding-3-small
+    private dimensionDetected: boolean = false;
     protected maxTokens: number = 8192; // Maximum tokens for OpenAI embedding models
 
     constructor(config: OpenAIEmbeddingConfig) {
@@ -28,6 +29,7 @@ export class OpenAIEmbedding extends Embedding {
 
         // Use known dimension for standard models
         if (knownModels[model]) {
+            this.dimension = knownModels[model].dimension;
             return knownModels[model].dimension;
         }
 
@@ -39,6 +41,7 @@ export class OpenAIEmbedding extends Embedding {
                 input: processedText,
                 encoding_format: 'float',
             });
+            this.dimension = response.data[0].embedding.length;
             return response.data[0].embedding.length;
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -60,8 +63,9 @@ export class OpenAIEmbedding extends Embedding {
         const knownModels = OpenAIEmbedding.getSupportedModels();
         if (knownModels[model] && this.dimension !== knownModels[model].dimension) {
             this.dimension = knownModels[model].dimension;
-        } else if (!knownModels[model]) {
+        } else if (!knownModels[model] && !this.dimensionDetected) {
             this.dimension = await this.detectDimension();
+            this.dimensionDetected = true;
         }
 
         try {
@@ -91,27 +95,45 @@ export class OpenAIEmbedding extends Embedding {
         const knownModels = OpenAIEmbedding.getSupportedModels();
         if (knownModels[model] && this.dimension !== knownModels[model].dimension) {
             this.dimension = knownModels[model].dimension;
-        } else if (!knownModels[model]) {
+        } else if (!knownModels[model] && !this.dimensionDetected) {
             this.dimension = await this.detectDimension();
+            this.dimensionDetected = true;
         }
 
-        try {
-            const response = await this.client.embeddings.create({
-                model: model,
-                input: processedTexts,
-                encoding_format: 'float',
-            });
+        const maxRetries = 3;
+        let lastError: Error | null = null;
 
-            this.dimension = response.data[0].embedding.length;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await this.client.embeddings.create({
+                    model: model,
+                    input: processedTexts,
+                    encoding_format: 'float',
+                });
 
-            return response.data.map((item) => ({
-                vector: item.embedding,
-                dimension: this.dimension
-            }));
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            throw new Error(`Failed to generate OpenAI batch embeddings: ${errorMessage}`);
+                this.dimension = response.data[0].embedding.length;
+
+                return response.data.map((item) => ({
+                    vector: item.embedding,
+                    dimension: this.dimension
+                }));
+            } catch (error: any) {
+                lastError = error;
+                const status = error?.status || error?.statusCode || 0;
+                const isRetryable = status === 429 || status >= 500;
+
+                if (isRetryable && attempt < maxRetries - 1) {
+                    const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+                    console.warn(`[OpenAI] Embedding API retryable error (${status}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                break;
+            }
         }
+
+        const errorMessage = lastError instanceof Error ? lastError.message : 'Unknown error';
+        throw new Error(`Failed to generate OpenAI batch embeddings: ${errorMessage}`);
     }
 
     getDimension(): number {
@@ -140,11 +162,13 @@ export class OpenAIEmbedding extends Embedding {
      */
     async setModel(model: string): Promise<void> {
         this.config.model = model;
+        this.dimensionDetected = false;
         const knownModels = OpenAIEmbedding.getSupportedModels();
         if (knownModels[model]) {
             this.dimension = knownModels[model].dimension;
         } else {
             this.dimension = await this.detectDimension();
+            this.dimensionDetected = true;
         }
     }
 

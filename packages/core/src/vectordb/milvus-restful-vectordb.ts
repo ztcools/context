@@ -153,7 +153,8 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         if (this.config.token) {
             headers['Authorization'] = `Bearer ${this.config.token}`;
         } else if (this.config.username && this.config.password) {
-            headers['Authorization'] = `Bearer ${this.config.username}:${this.config.password}`;
+            const credentials = Buffer.from(`${this.config.username}:${this.config.password}`).toString('base64');
+            headers['Authorization'] = `Basic ${credentials}`;
         }
 
         const requestOptions: RequestInit = {
@@ -165,24 +166,46 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
             requestOptions.body = JSON.stringify(data);
         }
 
-        try {
-            const response = await fetch(url, requestOptions);
+        const maxRetries = 3;
+        let lastError: Error | null = null;
 
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await fetch(url, requestOptions);
+
+                if (!response.ok) {
+                    const status = response.status;
+                    if ((status >= 500 || status === 429) && attempt < maxRetries - 1) {
+                        const delay = Math.pow(2, attempt) * 1000;
+                        console.warn(`[MilvusRestfulDB] Retryable HTTP ${status} from ${url}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const result: any = await response.json();
+
+                if (result.code !== 0 && result.code !== 200) {
+                    throw new Error(`Milvus API error: ${result.message || 'Unknown error'}`);
+                }
+
+                return result;
+            } catch (error: any) {
+                lastError = error;
+                const isNetworkError = error?.message?.includes('fetch') || error?.message?.includes('ECONNREFUSED') || error?.message?.includes('ETIMEDOUT');
+                if (isNetworkError && attempt < maxRetries - 1) {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    console.warn(`[MilvusRestfulDB] Network error for ${url}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                break;
             }
-
-            const result: any = await response.json();
-
-            if (result.code !== 0 && result.code !== 200) {
-                throw new Error(`Milvus API error: ${result.message || 'Unknown error'}`);
-            }
-
-            return result;
-        } catch (error) {
-            console.error(`[MilvusRestfulDB] Milvus REST API request failed:`, error);
-            throw error;
         }
+
+        console.error(`[MilvusRestfulDB] Milvus REST API request failed after ${maxRetries} attempts:`, lastError);
+        throw lastError || new Error('Milvus REST API request failed');
     }
 
     async createCollection(collectionName: string, dimension: number, description?: string): Promise<void> {
@@ -485,7 +508,7 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         }
     }
 
-    async query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]> {
+    async query(collectionName: string, filter?: string, outputFields?: string[], limit?: number): Promise<Record<string, any>[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
 
@@ -822,15 +845,48 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
     }
 
     /**
-     * Check collection limit
-     * Returns true if collection can be created, false if limit exceeded
-     * TODO: Implement proper collection limit checking for REST API
+     * Check collection limit by attempting to create a temporary test collection.
+     * Returns true if collection can be created, false if limit exceeded.
      */
     async checkCollectionLimit(): Promise<boolean> {
-        // TODO: Implement REST API version of collection limit checking
-        // For now, always return true to maintain compatibility
-        console.warn('[MilvusRestfulDB] ⚠️  checkCollectionLimit not implemented for REST API - returning true');
-        return true;
+        const testCollectionName = `_limit_test_${Date.now()}`;
+        try {
+            await this.ensureInitialized();
+            const restConfig = this.config as MilvusRestfulConfig;
+            // Create a minimal test collection to verify the limit is not reached
+            await this.makeRequest('/collections/create', 'POST', {
+                dbName: restConfig.database,
+                collectionName: testCollectionName,
+                schema: {
+                    fields: [
+                        { name: 'id', dataType: 'VarChar', maxLength: 512, isPrimaryKey: true },
+                        { name: 'vector', dataType: 'FloatVector', dim: 128 }
+                    ]
+                }
+            });
+            // Cleanup: drop the test collection
+            try {
+                await this.makeRequest('/collections/drop', 'POST', {
+                    dbName: restConfig.database,
+                    collectionName: testCollectionName
+                });
+            } catch { /* ignore cleanup failure */ }
+            return true;
+        } catch (error: any) {
+            const errorMessage = error.message || error.toString() || '';
+            if (/exceeded the limit number of collections/i.test(errorMessage)) {
+                console.warn(`[MilvusRestfulDB] Collection limit exceeded`);
+                return false;
+            }
+            // Distinguish between transient (allow) and fatal (refuse) errors
+            const isTransient = /ECONNREFUSED|ETIMEDOUT|5\d{2}|429/i.test(errorMessage);
+            if (isTransient) {
+                console.warn(`[MilvusRestfulDB] Collection limit check failed (transient): ${errorMessage}`);
+                return true; // Allow creation to proceed on transient errors
+            }
+            console.error(`[MilvusRestfulDB] Collection limit check failed (fatal): ${errorMessage}`);
+            return false; // Refuse creation on fatal errors (auth, config, etc.)
+        }
     }
 
     /**

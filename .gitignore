@@ -67,4 +67,4 @@ evaluation/repos
 repos
 
 evaluation/retrieval_results*
-.venv/
+.venv/test-repos/
