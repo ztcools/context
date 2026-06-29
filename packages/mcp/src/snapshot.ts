@@ -180,57 +180,80 @@ export class SnapshotManager {
     }
 
     public getIndexedCodebases(): string[] {
-        // Read from JSON file to ensure consistency and persistence.
-        // Convert old-format keys (filesystem paths) to identities on the fly.
+        // Merge file-based identities with in-memory state.
+        // File may be stale (read-only FS, cross-process writes), so always
+        // include in-memory entries that may have been added since last save.
+        const fileIdentities = new Set<string>();
         try {
-            if (!fs.existsSync(this.snapshotFilePath)) {
-                return [];
-            }
+            if (fs.existsSync(this.snapshotFilePath)) {
+                const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
+                const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
-            const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
-
-            if (this.isV2Format(snapshot)) {
-                return Object.entries(snapshot.codebases)
-                    .filter(([_, info]) => info.status === 'indexed')
-                    .map(([key, _]) => (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key);
-            } else {
-                // V1 format: keys are filesystem paths, convert to identities
-                const indexed = snapshot.indexedCodebases || [];
-                return indexed.map((p: string) => this.toIdentity(p));
+                if (this.isV2Format(snapshot)) {
+                    for (const [key, info] of Object.entries(snapshot.codebases)) {
+                        if (info.status === 'indexed') {
+                            const id = (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key;
+                            fileIdentities.add(id);
+                        }
+                    }
+                } else {
+                    const indexed = snapshot.indexedCodebases || [];
+                    for (const p of indexed) {
+                        fileIdentities.add(this.toIdentity(p));
+                    }
+                }
             }
         } catch (error) {
             console.warn(`[SNAPSHOT-DEBUG] Error reading indexed codebases from file:`, error);
-            return [...this.indexedCodebases];
         }
+
+        // Merge in-memory state (may have entries added since last save, e.g. on read-only FS)
+        for (const id of this.indexedCodebases) {
+            fileIdentities.add(id);
+        }
+
+        return Array.from(fileIdentities);
     }
 
     public getIndexingCodebases(): string[] {
+        // Merge file-based identities with in-memory state.
+        // File may be stale (read-only FS, cross-process writes), so always
+        // include in-memory entries that may have been added since last save.
+        const fileIdentities = new Set<string>();
         try {
-            if (!fs.existsSync(this.snapshotFilePath)) {
-                return [];
-            }
+            if (fs.existsSync(this.snapshotFilePath)) {
+                const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
+                const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
 
-            const snapshotData = fs.readFileSync(this.snapshotFilePath, 'utf8');
-            const snapshot: CodebaseSnapshot = JSON.parse(snapshotData);
-
-            if (this.isV2Format(snapshot)) {
-                return Object.entries(snapshot.codebases)
-                    .filter(([_, info]) => info.status === 'indexing')
-                    .map(([key, _]) => (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key);
-            } else {
-                if (Array.isArray(snapshot.indexingCodebases)) {
-                    return snapshot.indexingCodebases.map((p: string) => this.toIdentity(p));
-                } else if (snapshot.indexingCodebases && typeof snapshot.indexingCodebases === 'object') {
-                    return Object.keys(snapshot.indexingCodebases).map((p: string) => this.toIdentity(p));
+                if (this.isV2Format(snapshot)) {
+                    for (const [key, info] of Object.entries(snapshot.codebases)) {
+                        if (info.status === 'indexing') {
+                            const id = (key.startsWith('/') || key.startsWith('\\')) ? this.toIdentity(key) : key;
+                            fileIdentities.add(id);
+                        }
+                    }
+                } else {
+                    if (Array.isArray(snapshot.indexingCodebases)) {
+                        for (const p of snapshot.indexingCodebases) {
+                            fileIdentities.add(this.toIdentity(p));
+                        }
+                    } else if (snapshot.indexingCodebases && typeof snapshot.indexingCodebases === 'object') {
+                        for (const p of Object.keys(snapshot.indexingCodebases)) {
+                            fileIdentities.add(this.toIdentity(p));
+                        }
+                    }
                 }
             }
-
-            return [];
         } catch (error) {
             console.warn(`[SNAPSHOT-DEBUG] Error reading indexing codebases from file:`, error);
-            return Array.from(this.indexingCodebases.keys());
         }
+
+        // Merge in-memory state (may have entries added since last save, e.g. on read-only FS)
+        for (const id of this.indexingCodebases.keys()) {
+            fileIdentities.add(id);
+        }
+
+        return Array.from(fileIdentities);
     }
 
     /**
