@@ -579,14 +579,6 @@ export class Context {
         }
 
         if (isHybrid === true) {
-            try {
-                // Check collection stats to see if it has data
-                const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
-                console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
-            } catch (error) {
-                console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
-            }
-
             // 1. Generate query vector
             console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
             const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
@@ -676,24 +668,36 @@ export class Context {
 
     /**
      * Deduplicate search results by file + line range overlap.
+     * Uses a Map keyed by filePath for O(n) lookups instead of O(n²) scanning.
      * Keeps higher-scored result when two results from the same file overlap >50%.
      */
     private deduplicateResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
-        const kept: SemanticSearchResult[] = [];
+        // Group by filePath so overlap checks only happen within the same file
+        const byFile = new Map<string, SemanticSearchResult[]>();
+        for (const r of results) {
+            const list = byFile.get(r.relativePath);
+            if (list) {
+                list.push(r);
+            } else {
+                byFile.set(r.relativePath, [r]);
+            }
+        }
 
-        for (const result of results) {
-            const overlaps = kept.some((existing) => {
-                if (existing.relativePath !== result.relativePath) return false;
-                const overlapStart = Math.max(existing.startLine, result.startLine);
-                const overlapEnd = Math.min(existing.endLine, result.endLine);
-                if (overlapStart > overlapEnd) return false;
-                // Line ranges are inclusive (endLine = startLine + N - 1).
-                const overlapSize = overlapEnd - overlapStart + 1;
-                const resultSize = result.endLine - result.startLine + 1;
-                return resultSize > 0 && overlapSize / resultSize > 0.5;
-            });
-            if (!overlaps) {
-                kept.push(result);
+        const kept: SemanticSearchResult[] = [];
+        for (const [, fileResults] of byFile) {
+            for (const result of fileResults) {
+                const overlaps = kept.some((existing) => {
+                    if (existing.relativePath !== result.relativePath) return false;
+                    const overlapStart = Math.max(existing.startLine, result.startLine);
+                    const overlapEnd = Math.min(existing.endLine, result.endLine);
+                    if (overlapStart > overlapEnd) return false;
+                    const overlapSize = overlapEnd - overlapStart + 1;
+                    const resultSize = result.endLine - result.startLine + 1;
+                    return resultSize > 0 && overlapSize / resultSize > 0.5;
+                });
+                if (!overlaps) {
+                    kept.push(result);
+                }
             }
         }
 
@@ -1197,17 +1201,13 @@ export class Context {
     }
 
     /**
-     * Generate unique ID based on chunk content and location
-     * @param relativePath Relative path to the file
-     * @param startLine Start line number
-     * @param endLine End line number
-     * @param content Chunk content
-     * @returns Hash-based unique ID
+     * Generate unique ID from chunk location. The combination of relativePath,
+     * startLine, and endLine uniquely identifies a chunk — no need for content hashing.
+     * Special characters are replaced with safe alternatives.
      */
-    private generateId(relativePath: string, startLine: number, endLine: number, content: string): string {
-        const combinedString = `${relativePath}:${startLine}:${endLine}:${content}`;
-        const hash = crypto.createHash('sha256').update(combinedString, 'utf-8').digest('hex');
-        return `chunk_${hash.substring(0, 16)}`;
+    private generateId(relativePath: string, startLine: number, endLine: number, _content: string): string {
+        const safe = relativePath.replace(/[^a-zA-Z0-9._-]/g, '_');
+        return `chunk_${safe}:${startLine}:${endLine}`;
     }
 
     /**

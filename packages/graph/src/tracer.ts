@@ -86,10 +86,11 @@ export class CallTracer {
         }
 
         const queue: QueueItem[] = [{ nodeId: startNode.id, depth: 0, edgeType: 'CALLS' }];
+        let head = 0;
         visited.add(startNode.id);
 
-        while (queue.length > 0) {
-            const current = queue.shift()!;
+        while (head < queue.length) {
+            const current = queue[head++];
             if (current.depth >= maxDepth) continue;
 
             const edges = direction === 'outbound'
