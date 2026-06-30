@@ -305,9 +305,15 @@ export class FileSynchronizer {
             console.log(`Loaded snapshot from ${this.snapshotPath}`);
         } catch (error: any) {
             if (error.code === 'ENOENT') {
-                console.log(`Snapshot file not found at ${this.snapshotPath}. Generating new one.`);
-                this.fileHashes = await this.generateFileHashes(this.rootDir);
-                this.merkleDAG = this.buildMerkleDAG(this.fileHashes);
+                // Snapshot missing — start with empty state. Do NOT call
+                // generateFileHashes() here: it reads + SHA256-hashes every
+                // file in the project (9000+ for pytorch), which can crash
+                // the process on large repos. The full index is about to run
+                // anyway; the next incremental sync will detect all files as
+                // "added" and rebuild the merkle tree correctly.
+                console.log(`Snapshot file not found at ${this.snapshotPath}. Starting with empty state.`);
+                this.fileHashes = new Map();
+                this.merkleDAG = new MerkleDAG();
                 await this.saveSnapshot();
             } else {
                 throw error;
