@@ -196,7 +196,7 @@ export class GraphToolHandlers {
             console.log(`[GraphIndex] Registry built: ${registry.size()} functions/methods registered`);
 
             // Build per-file import map from IMPORTS edges
-            const crossEdges = this.resolveCrossFileCallsWithRegistry(
+            const crossEdges = await this.resolveCrossFileCallsWithRegistry(
                 graphBuffer, registry, project,
             );
             edgeCount += crossEdges;
@@ -703,17 +703,18 @@ export class GraphToolHandlers {
      * Resolve cross-file calls using the FunctionRegistry for O(1) lookups.
      * Mirrors codebase-memory-mcp's pass_calls.c resolution strategy.
      */
-    private resolveCrossFileCallsWithRegistry(
+    private async resolveCrossFileCallsWithRegistry(
         graphBuffer: InMemoryGraphBuffer,
         registry: FunctionRegistry,
         project: string,
-    ): number {
+    ): Promise<number> {
         let count = 0;
 
         // Find all IMPORTS edges
         const importEdges = graphBuffer.findEdgesByType('IMPORTS');
 
-        for (const edge of importEdges) {
+        for (let i = 0; i < importEdges.length; i++) {
+            const edge = importEdges[i];
             const sourceNode = graphBuffer.findNodeById(edge.sourceId);
             const targetNode = graphBuffer.findNodeById(edge.targetId);
             if (!sourceNode || !targetNode) continue;
@@ -765,6 +766,12 @@ export class GraphToolHandlers {
                 targetFile: resolvedNode.filePath,
             });
             count++;
+
+            // Yield the event loop every 50 import edges so the MCP protocol
+            // handler and vector index can continue running.
+            if (i % 50 === 0) {
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
         }
 
         console.log(`[GraphIndex] Resolved ${count} cross-file calls for project '${project}' via registry`);
@@ -855,7 +862,7 @@ export class GraphToolHandlers {
                 .map((f: string) => path.resolve(repoPath, f))
                 .filter((f: string) => fs.existsSync(f) && extSet.has(path.extname(f)));
         } catch (err: any) {
-            console.warn(`[Graph] detectChangedFiles failed for ${repoPath}: ${err.message}`);
+            console.warn(`[Graph] detectChangedFiles failed for ${repoPath}: ${err.message} `);
             return [];
         }
     }
@@ -872,7 +879,7 @@ export class GraphToolHandlers {
         // Try git ls-files first — respects .gitignore and is much faster
         try {
             const extPatterns = extensions.map((e) => `"*${e}"`).join(' ');
-            const output = execSync(`git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns}`, {
+            const output = execSync(`git - C "${dir}" ls - files--cached--others--exclude - standard-- ${extPatterns} `, {
                 encoding: 'utf-8',
                 timeout: 10_000,
                 maxBuffer: 10 * 1024 * 1024,
@@ -922,7 +929,7 @@ export class GraphToolHandlers {
         const results: string[] = [];
 
         try {
-            const output = execSync(`git -C "${dir}" ls-files --cached --others --exclude-standard`, {
+            const output = execSync(`git - C "${dir}" ls - files--cached--others--exclude - standard`, {
                 encoding: 'utf-8',
                 timeout: 10_000,
                 maxBuffer: 10 * 1024 * 1024,
