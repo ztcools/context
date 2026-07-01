@@ -24,6 +24,9 @@ import {
 
 // ── Internal helpers ──────────────────────────────────────────────
 
+/** Identifies a lazily-built secondary index. */
+type SecondaryIndexKind = 'label' | 'name' | 'srcType' | 'tgtType' | 'type';
+
 /** Composite edge key for dedup, matching C's "srcID:tgtID:type" format. */
 function makeEdgeKey(srcId: number, tgtId: number, type: string): string {
     return `${srcId}:${tgtId}:${type}`;
@@ -69,6 +72,14 @@ export class InMemoryGraphBuffer {
     /** Secondary: "type" → GraphEdge[] */
     private edgesByType: Map<string, GraphEdge[]> = new Map();
 
+    /**
+     * Which secondary indexes are currently materialized. Secondary indexes are
+     * built lazily on first query and dropped on the next mutation, so the
+     * insert-heavy indexing path (which never queries them) pays nothing to
+     * maintain them — a large win in both CPU and memory at scale.
+     */
+    private builtIndexes: Set<SecondaryIndexKind> = new Set();
+
     // ── String intern pool ────────────────────────────────────────
 
     /**
@@ -110,26 +121,29 @@ export class InMemoryGraphBuffer {
     ): number {
         const existing = this.nodeByQN.get(qualifiedName);
         if (existing) {
-            // Update existing node fields (src wins)
-            existing.label = label;
+            // Update existing node fields (src wins). Intern the same repetitive
+            // fields as on insert so updates don't reintroduce duplicate strings.
+            existing.label = this.intern(label) as GraphNodeLabel;
             existing.name = name;
-            existing.filePath = filePath;
+            existing.filePath = this.intern(filePath);
             existing.startLine = startLine;
             existing.endLine = endLine;
             existing.properties = properties;
-            // Update secondary indexes
-            this.removeFromSecondaryIndexes(existing);
-            this.addToSecondaryIndexes(existing);
+            // label/name may have changed → stale any built secondary indexes.
+            this.invalidateSecondaryIndexes();
             return existing.id;
         }
 
         const id = this.nextId++;
         const node: GraphNode = {
             id,
+            // Only intern highly-repetitive fields. name/qualifiedName are
+            // effectively unique per node, so interning them just bloats the
+            // intern pool with one entry each and saves nothing.
             project: this.intern(this.project),
-            label,
-            name: this.intern(name),
-            qualifiedName: this.intern(qualifiedName),
+            label: this.intern(label) as GraphNodeLabel,
+            name,
+            qualifiedName,
             filePath: this.intern(filePath),
             startLine,
             endLine,
@@ -138,40 +152,49 @@ export class InMemoryGraphBuffer {
 
         this.nodeByQN.set(node.qualifiedName, node);
         this.nodeById.set(id, node);
-        this.addToSecondaryIndexes(node);
+        this.invalidateSecondaryIndexes();
         return id;
     }
 
-    private addToSecondaryIndexes(node: GraphNode): void {
-        // By label
-        let labelArr = this.nodesByLabel.get(node.label);
-        if (!labelArr) {
-            labelArr = [];
-            this.nodesByLabel.set(node.label, labelArr);
-        }
-        labelArr.push(node);
+    // ── Lazy secondary index management ───────────────────────────
 
-        // By name
-        let nameArr = this.nodesByName.get(node.name);
-        if (!nameArr) {
-            nameArr = [];
-            this.nodesByName.set(node.name, nameArr);
-        }
-        nameArr.push(node);
+    /** Drop all materialized secondary indexes (called on any mutation). */
+    private invalidateSecondaryIndexes(): void {
+        if (this.builtIndexes.size === 0) return;
+        this.nodesByLabel.clear();
+        this.nodesByName.clear();
+        this.edgesBySourceType.clear();
+        this.edgesByTargetType.clear();
+        this.edgesByType.clear();
+        this.builtIndexes.clear();
     }
 
-    private removeFromSecondaryIndexes(node: GraphNode): void {
-        const labelArr = this.nodesByLabel.get(node.label);
-        if (labelArr) {
-            const idx = labelArr.findIndex((n) => n.id === node.id);
-            if (idx !== -1) labelArr.splice(idx, 1);
-        }
+    /** Build a single secondary index from the primary maps if not present. */
+    private ensureIndex(kind: SecondaryIndexKind): void {
+        if (this.builtIndexes.has(kind)) return;
 
-        const nameArr = this.nodesByName.get(node.name);
-        if (nameArr) {
-            const idx = nameArr.findIndex((n) => n.id === node.id);
-            if (idx !== -1) nameArr.splice(idx, 1);
+        if (kind === 'label' || kind === 'name') {
+            const map = kind === 'label' ? this.nodesByLabel : this.nodesByName;
+            for (const [, node] of this.nodeByQN) {
+                const key = kind === 'label' ? node.label : node.name;
+                let arr = map.get(key);
+                if (!arr) { arr = []; map.set(key, arr); }
+                arr.push(node);
+            }
+        } else {
+            const map = kind === 'srcType' ? this.edgesBySourceType
+                : kind === 'tgtType' ? this.edgesByTargetType
+                    : this.edgesByType;
+            for (const [, edge] of this.edgeByKey) {
+                const key = kind === 'srcType' ? makeSrcTypeKey(edge.sourceId, edge.type)
+                    : kind === 'tgtType' ? makeTgtTypeKey(edge.targetId, edge.type)
+                        : edge.type;
+                let arr = map.get(key);
+                if (!arr) { arr = []; map.set(key, arr); }
+                arr.push(edge);
+            }
         }
+        this.builtIndexes.add(kind);
     }
 
     /** Find a node by qualified name. O(1). */
@@ -186,11 +209,13 @@ export class InMemoryGraphBuffer {
 
     /** Find nodes by label. Returns borrowed array. */
     findNodesByLabel(label: string): GraphNode[] {
+        this.ensureIndex('label');
         return this.nodesByLabel.get(label) ?? [];
     }
 
     /** Find nodes by name (exact). Returns borrowed array. */
     findNodesByName(name: string): GraphNode[] {
+        this.ensureIndex('name');
         return this.nodesByName.get(name) ?? [];
     }
 
@@ -247,10 +272,7 @@ export class InMemoryGraphBuffer {
         this.nodeByQN.delete(node.qualifiedName);
         this.nodeById.delete(nodeId);
 
-        // Remove from secondary indexes
-        this.removeFromSecondaryIndexes(node);
-
-        // Cascade-delete edges
+        // Cascade-delete edges referencing this node
         const edgesToDelete: string[] = [];
         for (const [key, edge] of this.edgeByKey) {
             if (edge.sourceId === nodeId || edge.targetId === nodeId) {
@@ -258,12 +280,11 @@ export class InMemoryGraphBuffer {
             }
         }
         for (const key of edgesToDelete) {
-            const edge = this.edgeByKey.get(key);
-            if (edge) {
-                this.removeEdgeFromSecondaryIndexes(edge);
-                this.edgeByKey.delete(key);
-            }
+            this.edgeByKey.delete(key);
         }
+
+        // Secondary indexes now stale — drop them (rebuilt lazily on next query).
+        this.invalidateSecondaryIndexes();
     }
 
     // ── Edge operations ───────────────────────────────────────────
@@ -296,69 +317,32 @@ export class InMemoryGraphBuffer {
             project: this.intern(this.project),
             sourceId,
             targetId,
-            type,
+            // Edge types come from a tiny fixed set — interning collapses them
+            // to a single shared string across all edges.
+            type: this.intern(type) as GraphEdgeType,
             properties,
         };
 
         this.edgeByKey.set(key, edge);
-        this.addEdgeToSecondaryIndexes(edge);
+        this.invalidateSecondaryIndexes();
         return id;
-    }
-
-    private addEdgeToSecondaryIndexes(edge: GraphEdge): void {
-        // By source+type
-        const srcTypeKey = makeSrcTypeKey(edge.sourceId, edge.type);
-        let arr = this.edgesBySourceType.get(srcTypeKey);
-        if (!arr) {
-            arr = [];
-            this.edgesBySourceType.set(srcTypeKey, arr);
-        }
-        arr.push(edge);
-
-        // By target+type
-        const tgtTypeKey = makeTgtTypeKey(edge.targetId, edge.type);
-        arr = this.edgesByTargetType.get(tgtTypeKey);
-        if (!arr) {
-            arr = [];
-            this.edgesByTargetType.set(tgtTypeKey, arr);
-        }
-        arr.push(edge);
-
-        // By type
-        arr = this.edgesByType.get(edge.type);
-        if (!arr) {
-            arr = [];
-            this.edgesByType.set(edge.type, arr);
-        }
-        arr.push(edge);
-    }
-
-    private removeEdgeFromSecondaryIndexes(edge: GraphEdge): void {
-        const removeFrom = (map: Map<string, GraphEdge[]>, key: string) => {
-            const arr = map.get(key);
-            if (arr) {
-                const idx = arr.findIndex((e) => e.id === edge.id);
-                if (idx !== -1) arr.splice(idx, 1);
-            }
-        };
-
-        removeFrom(this.edgesBySourceType, makeSrcTypeKey(edge.sourceId, edge.type));
-        removeFrom(this.edgesByTargetType, makeTgtTypeKey(edge.targetId, edge.type));
-        removeFrom(this.edgesByType, edge.type);
     }
 
     /** Find edges from sourceId with given type. */
     findEdgesBySourceType(sourceId: number, type: string): GraphEdge[] {
+        this.ensureIndex('srcType');
         return this.edgesBySourceType.get(makeSrcTypeKey(sourceId, type)) ?? [];
     }
 
     /** Find edges to targetId with given type. */
     findEdgesByTargetType(targetId: number, type: string): GraphEdge[] {
+        this.ensureIndex('tgtType');
         return this.edgesByTargetType.get(makeTgtTypeKey(targetId, type)) ?? [];
     }
 
     /** Find all edges of a given type. */
     findEdgesByType(type: string): GraphEdge[] {
+        this.ensureIndex('type');
         return this.edgesByType.get(type) ?? [];
     }
 
@@ -369,6 +353,7 @@ export class InMemoryGraphBuffer {
 
     /** Count edges of a given type. */
     edgeCountByType(type: string): number {
+        this.ensureIndex('type');
         return this.edgesByType.get(type)?.length ?? 0;
     }
 
@@ -387,6 +372,7 @@ export class InMemoryGraphBuffer {
         this.edgesBySourceType.clear();
         this.edgesByTargetType.clear();
         this.edgesByType.clear();
+        this.builtIndexes.clear();
         this.nextId = 1;
     }
 

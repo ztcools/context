@@ -63,7 +63,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     content_rowid='id',
     tokenize='unicode61 remove_diacritics 1'
 );
+`;
 
+// FTS5 sync triggers kept separate so bulk indexing can drop them, load raw,
+// and rebuild the FTS index once — the per-row 'delete' op on an external-content
+// FTS5 table costs ~1ms/row, which turns a full re-index of a large project into
+// a multi-minute event-loop stall. See disableFtsTriggers()/rebuildFtsFromContent().
+const FTS_TRIGGERS_SQL = `
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
     INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
     VALUES (new.id, new.name, new.qualified_name, new.file_path);
@@ -91,13 +97,12 @@ export class SqliteGraphStore implements GraphStore {
     private upsertNodeStmt!: Database.Statement;
     private upsertEdgeSelectStmt!: Database.Statement;
     private upsertEdgeInsertStmt!: Database.Statement;
-    private deleteNodesByFileStmt!: Database.Statement;
     private deleteEdgesByFileStmt!: Database.Statement;
     private deleteProjectNodesStmt!: Database.Statement;
     private deleteProjectEdgesStmt!: Database.Statement;
+    private deleteProjectNodesChunkStmt!: Database.Statement;
+    private deleteProjectEdgesChunkStmt!: Database.Statement;
     private deleteNodesByFilePathStmt!: Database.Statement;
-    private updateNodeFileStmt!: Database.Statement;
-    private deleteNodeEdgesStmt!: Database.Statement;
 
     constructor(dbPath?: string) {
         if (dbPath) {
@@ -108,7 +113,18 @@ export class SqliteGraphStore implements GraphStore {
             this.dbPath = path.join(graphDir, 'knowledge-graph.db');
         }
         this.db = new Database(this.dbPath);
+        // Schema must exist before preparing statements — a brand-new DB has no
+        // `nodes`/`edges` tables yet, and prepare() would throw "no such table".
+        this._ensureSchema();
         this._prepareStatements();
+    }
+
+    /** Create tables, indexes, FTS vtable and sync triggers if absent. Idempotent. */
+    private _ensureSchema(): void {
+        this.db.pragma('journal_mode = WAL');
+        this.db.pragma('foreign_keys = ON');
+        this.db.exec(SCHEMA_SQL);
+        this.db.exec(FTS_TRIGGERS_SQL);
     }
 
     /** Pre-compile all hot-path statements once. */
@@ -131,9 +147,6 @@ export class SqliteGraphStore implements GraphStore {
             INSERT INTO edges (project, source_id, target_id, type, properties_json)
             VALUES (?, ?, ?, ?, ?)
         `);
-        this.deleteNodesByFileStmt = this.db.prepare(
-            'SELECT id FROM nodes WHERE project = ? AND file_path = ?'
-        );
         this.deleteEdgesByFileStmt = this.db.prepare(
             `DELETE FROM edges WHERE project = ? AND (
                 source_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)
@@ -146,21 +159,24 @@ export class SqliteGraphStore implements GraphStore {
         this.deleteProjectEdgesStmt = this.db.prepare(
             'DELETE FROM edges WHERE project = ?'
         );
+        // Chunked variants for bulk deletion — a single DELETE of ~10⁶ indexed
+        // rows blocks the event loop for seconds; these let the caller yield
+        // between bounded batches.
+        this.deleteProjectNodesChunkStmt = this.db.prepare(
+            'DELETE FROM nodes WHERE id IN (SELECT id FROM nodes WHERE project = ? LIMIT ?)'
+        );
+        this.deleteProjectEdgesChunkStmt = this.db.prepare(
+            'DELETE FROM edges WHERE id IN (SELECT id FROM edges WHERE project = ? LIMIT ?)'
+        );
         this.deleteNodesByFilePathStmt = this.db.prepare(
             'DELETE FROM nodes WHERE project = ? AND file_path = ?'
-        );
-        this.updateNodeFileStmt = this.db.prepare(
-            'UPDATE nodes SET file_path = ? WHERE project = ? AND qualified_name = ?'
-        );
-        this.deleteNodeEdgesStmt = this.db.prepare(
-            'DELETE FROM edges WHERE project = ? AND source_id = ?'
         );
     }
 
     initialize(): void {
-        this.db.pragma('journal_mode = WAL');
-        this.db.pragma('foreign_keys = ON');
-        this.db.exec(SCHEMA_SQL);
+        // Schema is already ensured in the constructor; kept for backward
+        // compatibility and to re-assert the schema on explicit re-init.
+        this._ensureSchema();
     }
 
     close(): void {
@@ -172,6 +188,38 @@ export class SqliteGraphStore implements GraphStore {
     /** Flush the WAL to the main database file and release space. */
     checkpoint(): void {
         this.db.pragma('wal_checkpoint(TRUNCATE)');
+    }
+
+    // ── Bulk-load mode ───────────────────────────────────────────
+    // A full (re)index rewrites an entire project's rows. Two per-row costs
+    // dominate and would otherwise stall the event loop for seconds-to-minutes:
+    //   1. FTS5 sync triggers: ~5× slower inserts and ~1ms/row deletes.
+    //   2. foreign_keys=ON: a referencing-row scan per node delete.
+    // beginBulkLoad() disables both; endBulkLoad() rebuilds the FTS index once
+    // and restores both. Safe because Phase 3 deletes edges+nodes explicitly and
+    // only re-inserts edges whose endpoints exist, so integrity holds by
+    // construction. Must be called OUTSIDE any transaction (PRAGMA/DDL).
+
+    /** Enter bulk-load mode: drop FTS triggers and disable FK enforcement. */
+    beginBulkLoad(): void {
+        this.db.pragma('foreign_keys = OFF');
+        this.db.exec(`
+            DROP TRIGGER IF EXISTS nodes_ai;
+            DROP TRIGGER IF EXISTS nodes_ad;
+            DROP TRIGGER IF EXISTS nodes_au;
+        `);
+    }
+
+    /**
+     * Leave bulk-load mode: rebuild the FTS index from the `nodes` content
+     * table, reinstall the sync triggers, and re-enable FK enforcement.
+     * Rebuild is O(total nodes) with a tiny constant (~1s per ~300K nodes)
+     * versus per-row trigger maintenance.
+     */
+    endBulkLoad(): void {
+        this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
+        this.db.exec(FTS_TRIGGERS_SQL);
+        this.db.pragma('foreign_keys = ON');
     }
 
     // ── Node operations ──────────────────────────────────────────
@@ -510,6 +558,16 @@ export class SqliteGraphStore implements GraphStore {
     deleteProject(project: string): void {
         this.deleteProjectEdgesStmt.run(project);
         this.deleteProjectNodesStmt.run(project);
+    }
+
+    /** Delete up to `limit` edge rows for a project. Returns rows deleted (0 when done). */
+    deleteProjectEdgesChunk(project: string, limit: number): number {
+        return this.deleteProjectEdgesChunkStmt.run(project, limit).changes;
+    }
+
+    /** Delete up to `limit` node rows for a project. Returns rows deleted (0 when done). */
+    deleteProjectNodesChunk(project: string, limit: number): number {
+        return this.deleteProjectNodesChunkStmt.run(project, limit).changes;
     }
 
     deleteNodesByFile(project: string, filePath: string): void {

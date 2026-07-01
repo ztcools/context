@@ -211,76 +211,109 @@ export class GraphToolHandlers {
             console.log(`[GraphIndex] Phase 3: flushing ${nodeCount} nodes, ${edgeCount} edges to SQLite...`);
 
             const isIncremental = !!(specificFiles || mode === 'incremental');
-            // 10K per batch — 100K nodes = 10 yields instead of 100.
+            // 10K per batch — yield the event loop between batches so the MCP
+            // protocol handler stays responsive during a large flush.
             const BATCH_SIZE = 10000;
-
-            if (isIncremental) {
-                const deleteFiles = [...new Set(graphBuffer.getAllFiles())];
-                for (const filePath of deleteFiles) {
-                    this.store.deleteNodesByFile(project, filePath);
-                }
-            } else {
-                this.store.deleteProject(project);
-            }
 
             const allNodes = graphBuffer.getAllNodes();
             const allEdges = graphBuffer.getAllEdges();
             const idMap = new Map<number, number>();
-
-            // Use a single giant transaction for nodes — SQLite journal is
-            // per-connection and batches are an MCP-yield optimisation, not a
-            // correctness constraint. One transaction is 10-50× faster.
-            this.store.beginTransaction();
-            try {
-                for (const node of allNodes) {
-                    const realId = this.store.upsertNode({
-                        project: node.project,
-                        label: node.label,
-                        name: node.name,
-                        qualifiedName: node.qualifiedName,
-                        filePath: node.filePath,
-                        startLine: node.startLine,
-                        endLine: node.endLine,
-                        properties: node.properties,
-                    });
-                    idMap.set(node.id, realId);
-                }
-                this.store.commitTransaction();
-            } catch (e) {
-                try { this.store.rollbackTransaction(); } catch { /* ignore */ }
-                throw e;
-            }
-            // Yield once after all nodes are written
-            await new Promise<void>(resolve => setImmediate(resolve));
-
-            // Flush edges in one transaction, yielding between batches
+            let writtenNodes = 0;
             let writtenEdges = 0;
-            this.store.beginTransaction();
+
+            // Enter bulk-load mode (drops FTS triggers + FK enforcement). With
+            // these on, a full re-index of a large project spends *minutes* in
+            // per-row FTS deletes and FK checks, blocking the event loop and
+            // making the MCP server appear hung ("stuck at phase 3"). We rebuild
+            // the FTS index once on exit instead — orders of magnitude faster.
+            this.store.beginBulkLoad();
             try {
-                for (const edge of allEdges) {
-                    if (writtenEdges > 0 && writtenEdges % BATCH_SIZE === 0) {
-                        this.store.commitTransaction();
+                if (isIncremental) {
+                    const deleteFiles = [...new Set(graphBuffer.getAllFiles())];
+                    for (const filePath of deleteFiles) {
+                        this.store.deleteNodesByFile(project, filePath);
+                    }
+                } else {
+                    // Delete the project's existing rows in bounded batches,
+                    // yielding between each — a full project can be ~10⁶ indexed
+                    // rows, and one giant DELETE would stall the event loop for
+                    // seconds. Edges first (they reference nodes), then nodes.
+                    while (this.store.deleteProjectEdgesChunk(project, BATCH_SIZE) > 0) {
                         await new Promise<void>(resolve => setImmediate(resolve));
-                        this.store.beginTransaction();
                     }
-                    const realSourceId = idMap.get(edge.sourceId);
-                    const realTargetId = idMap.get(edge.targetId);
-                    if (realSourceId === undefined || realTargetId === undefined) {
-                        continue;
+                    while (this.store.deleteProjectNodesChunk(project, BATCH_SIZE) > 0) {
+                        await new Promise<void>(resolve => setImmediate(resolve));
                     }
-                    this.store.upsertEdge({
-                        project: edge.project,
-                        sourceId: realSourceId,
-                        targetId: realTargetId,
-                        type: edge.type,
-                        properties: edge.properties,
-                    });
-                    writtenEdges++;
                 }
-                this.store.commitTransaction();
-            } catch (e) {
-                try { this.store.rollbackTransaction(); } catch { /* ignore */ }
-                throw e;
+
+                // Flush nodes, yielding between batches so we never block the
+                // event loop for more than one batch worth of inserts.
+                this.store.beginTransaction();
+                try {
+                    for (const node of allNodes) {
+                        if (writtenNodes > 0 && writtenNodes % BATCH_SIZE === 0) {
+                            this.store.commitTransaction();
+                            await new Promise<void>(resolve => setImmediate(resolve));
+                            this.store.beginTransaction();
+                        }
+                        const realId = this.store.upsertNode({
+                            project: node.project,
+                            label: node.label,
+                            name: node.name,
+                            qualifiedName: node.qualifiedName,
+                            filePath: node.filePath,
+                            startLine: node.startLine,
+                            endLine: node.endLine,
+                            properties: node.properties,
+                        });
+                        idMap.set(node.id, realId);
+                        writtenNodes++;
+                    }
+                    this.store.commitTransaction();
+                } catch (e) {
+                    try { this.store.rollbackTransaction(); } catch { /* ignore */ }
+                    throw e;
+                }
+                // Yield after all nodes are written, before edges.
+                await new Promise<void>(resolve => setImmediate(resolve));
+
+                // Flush edges, yielding between batches.
+                this.store.beginTransaction();
+                try {
+                    for (const edge of allEdges) {
+                        if (writtenEdges > 0 && writtenEdges % BATCH_SIZE === 0) {
+                            this.store.commitTransaction();
+                            await new Promise<void>(resolve => setImmediate(resolve));
+                            this.store.beginTransaction();
+                        }
+                        const realSourceId = idMap.get(edge.sourceId);
+                        const realTargetId = idMap.get(edge.targetId);
+                        if (realSourceId === undefined || realTargetId === undefined) {
+                            continue;
+                        }
+                        this.store.upsertEdge({
+                            project: edge.project,
+                            sourceId: realSourceId,
+                            targetId: realTargetId,
+                            type: edge.type,
+                            properties: edge.properties,
+                        });
+                        writtenEdges++;
+                    }
+                    this.store.commitTransaction();
+                } catch (e) {
+                    try { this.store.rollbackTransaction(); } catch { /* ignore */ }
+                    throw e;
+                }
+            } finally {
+                // Leave bulk-load mode even if the flush threw partway: rebuild
+                // the FTS index (keeps full-text search consistent with the
+                // `nodes` table), reinstall triggers, and restore FK enforcement.
+                try {
+                    this.store.endBulkLoad();
+                } catch (e: any) {
+                    console.warn(`[GraphIndex] FTS rebuild failed (search may be stale until next index): ${e.message}`);
+                }
             }
 
             // ── WAL checkpoint: flush accumulated WAL to the main DB file ──
