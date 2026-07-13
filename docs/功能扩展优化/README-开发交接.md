@@ -14,7 +14,7 @@
 
 **架构原则**:
 - 不修改原 claude-context 的向量/embedding/Milvus 接口
-- 新增独立包 `@zilliz/claude-context-graph`
+- 新增独立包 `@seeway/claude-context-graph`
 - 工具面简化为 4 个核心工具，其余能力内部自动编排
 
 ---
@@ -33,7 +33,7 @@ main (aab75b2) ← 原始项目，未修改
 
 ## 三、新增内容
 
-### 3.1 新增包: `packages/graph` (`@zilliz/claude-context-graph`)
+### 3.1 新增包: `packages/graph` (`@seeway/claude-context-graph`)
 
 | 模块 | 文件 | 功能 |
 |------|------|------|

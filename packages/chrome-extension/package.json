@@ -1,5 +1,5 @@
 {
-    "name": "@zilliz/claude-context-chrome-extension",
+    "name": "@seeway/claude-context-chrome-extension",
     "version": "0.1.4",
     "description": "Claude Context Chrome extension for web-based code indexing",
     "private": true,
@@ -13,7 +13,7 @@
         "build:milvus": "echo 'build:milvus script not implemented'"
     },
     "dependencies": {
-        "@zilliz/claude-context-core": "workspace:*"
+        "@seeway/claude-context-core": "workspace:*"
     },
     "overrides": {
         "@zilliz/milvus2-sdk-node": false
@@ -43,15 +43,11 @@
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/zilliztech/claude-context.git",
+        "url": "https://github.com/ztcools/-AI-.git",
         "directory": "packages/chrome-extension"
     },
     "license": "MIT",
     "main": "content.js",
     "keywords": [],
-    "author": "",
-    "bugs": {
-        "url": "https://github.com/zilliztech/claude-context/issues"
-    },
-    "homepage": "https://github.com/zilliztech/claude-context#readme"
+    "author": ""
 }

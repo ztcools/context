@@ -13,7 +13,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { GraphToolHandlers } from "./graph-handlers.js";
-import { getRepoIdentity } from "@zilliz/claude-context-core";
+import { getRepoIdentity } from "@seeway/claude-context-core";
 
 async function withTempRepo(
     files: Record<string, string>,

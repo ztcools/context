@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity } from "@zilliz/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity } from "@seeway/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, CodebaseInfoIndexFailed, CodebaseInfoIndexing, CodebaseInfoIndexed, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
@@ -172,7 +172,7 @@ export class ToolHandlers {
      * to querying document metadata for old collections,
      * and updates the snapshot with discovered codebases.
      *
-     * Logic: Compare mcp-codebase-snapshot.json with zilliz cloud collections
+     * Logic: Compare mcp-codebase-snapshot.json with Zilliz Cloud collections
      * - If local snapshot has extra directories (not in cloud), remove them
      * - If local snapshot is missing directories (exist in cloud), ignore them
      */

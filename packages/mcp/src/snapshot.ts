@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { getRepoIdentity } from "@zilliz/claude-context-core";
+import { getRepoIdentity } from "@seeway/claude-context-core";
 import {
     CodebaseSnapshot,
     CodebaseSnapshotV1,

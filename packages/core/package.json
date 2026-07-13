@@ -1,5 +1,5 @@
 {
-    "name": "@zilliz/claude-context-core",
+    "name": "@seeway/claude-context-core",
     "version": "0.1.14",
     "description": "Core indexing engine for Claude Context",
     "main": "dist/index.js",
@@ -39,17 +39,10 @@
         "ts-jest": "^29.4.0",
         "typescript": "^5.0.0"
     },
-    "files": [
-        "dist",
-        "README.md"
-    ],
     "repository": {
         "type": "git",
-        "url": "https://github.com/zilliztech/claude-context.git",
+        "url": "https://github.com/ztcools/-AI-.git",
         "directory": "packages/core"
     },
-    "license": "MIT",
-    "publishConfig": {
-        "access": "public"
-    }
+    "license": "MIT"
 }

@@ -24,7 +24,7 @@ INSTALL_DIR="$REAL_HOME/.claude-context"
 REPO_URL="https://github.com/ztcools/-AI-.git"
 
 echo -e "${GREEN}============================================${NC}"
-echo -e "${GREEN}  Claude Context 安装脚本${NC}"
+echo -e "${GREEN}  Seeway Claude Context 安装脚本${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
 

@@ -25,8 +25,8 @@ import {
     GraphSearchOptions,
     TraceOptions,
     parseWorkerPath,
-} from '@zilliz/claude-context-graph';
-import { getRepoIdentity } from '@zilliz/claude-context-core';
+} from '@seeway/claude-context-graph';
+import { getRepoIdentity } from '@seeway/claude-context-core';
 
 // Shared directory ignore set for both code and IaC file scanning
 // Keep in sync with core's DEFAULT_IGNORE_PATTERNS in context.ts
