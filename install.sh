@@ -169,7 +169,7 @@ if [ -n "$SUDO_USER" ]; then
     chown "$SUDO_USER":"$SUDO_USER" "$CLAUDE_JSON" 2>/dev/null || true
 fi
 
-echo -e "${YELLOW}[7/7] 安装代码上下文策略到用户级 CLAUDE.md...${NC}"
+echo -e "${YELLOW}[7/7] 安装上下文策略与 /seeway 命令到用户级...${NC}"
 RULES_SRC="$INSTALL_DIR/rules/code-context-policy.md"
 CLAUDE_MD="$REAL_HOME/.claude/CLAUDE.md"
 BEGIN_MARK="<!-- BEGIN claude-context policy (managed by install.sh — do not edit inside) -->"
@@ -206,6 +206,20 @@ else
     echo -e "${YELLOW}  未找到 $RULES_SRC，跳过策略安装${NC}"
 fi
 
+# 安装 /seeway-* 自定义 Slash 命令到用户级 commands 目录
+COMMANDS_SRC="$INSTALL_DIR/commands"
+COMMANDS_DST="$REAL_HOME/.claude/commands"
+if [ -d "$COMMANDS_SRC" ]; then
+    mkdir -p "$COMMANDS_DST"
+    cp -f "$COMMANDS_SRC"/seeway-*.md "$COMMANDS_DST"/ 2>/dev/null || true
+    if [ -n "$SUDO_USER" ]; then
+        chown -R "$SUDO_USER":"$SUDO_USER" "$COMMANDS_DST" 2>/dev/null || true
+    fi
+    echo -e "${GREEN}  ✓ 已安装命令: /seeway-index /seeway-search /seeway-clear /seeway-status${NC}"
+else
+    echo -e "${YELLOW}  未找到 $COMMANDS_SRC，跳过 /seeway 命令安装${NC}"
+fi
+
 echo ""
 echo -e "${GREEN}============================================${NC}"
 echo -e "${GREEN}  安装完成！${NC}"
@@ -214,6 +228,7 @@ echo ""
 echo "  安装位置: $INSTALL_DIR"
 echo "  配置文件: $CLAUDE_JSON"
 echo "  上下文策略: $CLAUDE_MD（仅在 claude-context 工具可用的会话生效）"
+echo "  自定义命令: $COMMANDS_DST/seeway-*.md"
 echo ""
 echo -e "${YELLOW}  下一步: 重启 Claude Code，输入 /mcp 确认 claude-context 已连接。${NC}"
-echo -e "${YELLOW}  然后在对话框说"索引当前项目"即可开始使用。${NC}"
+echo -e "${YELLOW}  然后可用 /seeway-index <路径> 索引、/seeway-search <查询> 检索。${NC}"
