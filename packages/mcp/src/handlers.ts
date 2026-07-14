@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity } from "@seeway/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity, envManager } from "@seeway/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, CodebaseInfoIndexFailed, CodebaseInfoIndexing, CodebaseInfoIndexed, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
@@ -30,6 +30,14 @@ export class ToolHandlers {
      * re-triggering on every subsequent search.
      */
     private autoGraphBuildTriggered: Set<string> = new Set();
+    /**
+     * Projects whose architecture summary has already been appended to a search
+     * result this session. The architecture block (entry points + clusters) is
+     * repo-level and stable — repeating it on every search in the same session
+     * is pure token waste. We emit it once per project per session; subsequent
+     * searches skip it. Cleared naturally on server restart.
+     */
+    private architectureEmitted: Set<string> = new Set();
 
     constructor(context: Context, snapshotManager: SnapshotManager, graphToolHandlers?: GraphToolHandlers) {
         this.context = context;
@@ -37,6 +45,32 @@ export class ToolHandlers {
         this.graphToolHandlers = graphToolHandlers || null;
         this.currentWorkspace = process.cwd();
         console.log(`[WORKSPACE] Current workspace: ${this.currentWorkspace}`);
+    }
+
+    /**
+     * Search precision / token knobs, read from env so operators can tune the
+     * read-vs-search tradeoff without a rebuild. Defaults favor precise,
+     * token-lean context over exhaustive recall:
+     *  - SEARCH_DEFAULT_LIMIT   fallback result count when caller omits `limit` (default 10)
+     *  - SEARCH_THRESHOLD       min cosine score, dense (non-hybrid) path only (default 0.3)
+     *  - SEARCH_SNIPPET_MAX_CHARS  per-snippet char cap (default 2500 ≈ 625 tokens; was 5000)
+     *  - SEARCH_SCORE_RATIO     relative tail cutoff in [0,1]; drop results scoring
+     *                           below ratio×topScore. 0 disables. Works in both
+     *                           dense and hybrid/RRF modes since it's relative. (default 0)
+     */
+    private getSearchTuning(): { defaultLimit: number; threshold: number; snippetMaxChars: number; scoreRatio: number } {
+        const num = (name: string, fallback: number): number => {
+            const raw = envManager.get(name);
+            if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+            const v = Number(raw);
+            return Number.isFinite(v) ? v : fallback;
+        };
+        return {
+            defaultLimit: Math.max(1, Math.min(50, num('SEARCH_DEFAULT_LIMIT', 10))),
+            threshold: num('SEARCH_THRESHOLD', 0.3),
+            snippetMaxChars: Math.max(200, num('SEARCH_SNIPPET_MAX_CHARS', 2500)),
+            scoreRatio: Math.max(0, Math.min(1, num('SEARCH_SCORE_RATIO', 0))),
+        };
     }
 
     /**
@@ -836,8 +870,9 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath = ".", query, limit = 10, extensionFilter } = args;
-        const resultLimit = limit || 10;
+        const tuning = this.getSearchTuning();
+        const { path: codebasePath = ".", query, limit, extensionFilter } = args;
+        const resultLimit = limit || tuning.defaultLimit;
 
         try {
             // Sync indexed codebases from cloud in background — don't block indexing
@@ -960,7 +995,7 @@ export class ToolHandlers {
                 searchCodebasePath,
                 query,
                 Math.min(resultLimit, 50),
-                0.3,
+                tuning.threshold,
                 filterExpr
             );
 
@@ -1030,10 +1065,27 @@ export class ToolHandlers {
                 if (!overlaps) dedupedResults.push(r);
             }
 
+            // Relative-score tail cutoff. Results are rank-ordered (best first),
+            // so once a result scores below ratio×topScore it's a weak match that
+            // mostly wastes tokens. This is relative, so it works in both the
+            // dense path and the hybrid/RRF path (where the absolute `threshold`
+            // above is ignored). Disabled when SEARCH_SCORE_RATIO=0. Always keeps
+            // at least the top result.
+            let scoredResults = dedupedResults;
+            if (tuning.scoreRatio > 0 && dedupedResults.length > 1) {
+                const topScore = Number(dedupedResults[0]?.score) || 0;
+                if (topScore > 0) {
+                    const floor = topScore * tuning.scoreRatio;
+                    scoredResults = dedupedResults.filter((r: any, i: number) =>
+                        i === 0 || (Number(r.score) || 0) >= floor
+                    );
+                }
+            }
+
             // Format results
-            const formattedResults = dedupedResults.map((result: any, index: number) => {
+            const formattedResults = scoredResults.map((result: any, index: number) => {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
-                const context = truncateContent(result.content, 5000);
+                const context = truncateContent(result.content, tuning.snippetMaxChars);
                 const codebaseInfo = path.basename(searchCodebasePath);
 
                 return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
@@ -1042,10 +1094,11 @@ export class ToolHandlers {
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
             }).join('\n');
 
-            const dupNote = dedupedResults.length < searchResults.length
-                ? ` (${searchResults.length - dedupedResults.length} overlapping snippet(s) merged)`
+            const mergedCount = searchResults.length - scoredResults.length;
+            const dupNote = mergedCount > 0
+                ? ` (${mergedCount} overlapping/low-score snippet(s) trimmed)`
                 : '';
-            let resultMessage = `Found ${dedupedResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${dupNote}${indexingStatusMessage}`;
+            let resultMessage = `Found ${scoredResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${dupNote}${indexingStatusMessage}`;
             if (searchCodebasePath !== absolutePath) {
                 resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
             }
@@ -1055,7 +1108,7 @@ export class ToolHandlers {
             if (this.graphToolHandlers) {
                 try {
                     resultMessage += this.enrichWithGraphContextDeep(
-                        dedupedResults,
+                        scoredResults,
                         searchCodebasePath,
                     );
                 } catch (graphErr: any) {
@@ -1685,8 +1738,11 @@ export class ToolHandlers {
             break;
         }
 
-        // === Layer 3: Architecture summary ===
-        try {
+        // === Layer 3: Architecture summary (once per project per session) ===
+        // The architecture block is repo-level and stable; emitting it on every
+        // search wastes tokens. Emit only on the first search for this project.
+        if (!this.architectureEmitted.has(project)) {
+          try {
             const archResult = this.graphToolHandlers!.handleGetArchitecture({
                 project,
             });
@@ -1728,8 +1784,12 @@ export class ToolHandlers {
                 lines.push(...summary);
                 lines.push('');
             }
-        } catch {
+            // Mark emitted even if summary was empty — an empty architecture
+            // won't become useful on the next search, so don't retry every time.
+            this.architectureEmitted.add(project);
+          } catch {
             // architecture failure shouldn't affect main flow
+          }
         }
 
         return lines.length > 0 ? '\n\n' + lines.join('\n') : '';

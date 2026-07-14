@@ -28,7 +28,7 @@ echo -e "${GREEN}  Seeway Claude Context 安装脚本${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
 
-echo -e "${YELLOW}[1/6] 检查 Node.js...${NC}"
+echo -e "${YELLOW}[1/7] 检查 Node.js...${NC}"
 if command -v node &> /dev/null; then
     NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
     if [ "$NODE_VERSION" -ge 18 ]; then
@@ -45,7 +45,7 @@ else
     exit 1
 fi
 
-echo -e "${YELLOW}[2/6] 检查 pnpm...${NC}"
+echo -e "${YELLOW}[2/7] 检查 pnpm...${NC}"
 if command -v pnpm &> /dev/null; then
     echo -e "${GREEN}  ✓ pnpm $(pnpm --version)${NC}"
 else
@@ -54,7 +54,7 @@ else
     echo -e "${GREEN}  ✓ pnpm 安装完成${NC}"
 fi
 
-echo -e "${YELLOW}[3/6] 克隆仓库...${NC}"
+echo -e "${YELLOW}[3/7] 克隆仓库...${NC}"
 if [ -d "$INSTALL_DIR" ]; then
     echo "  目录已存在，正在更新..."
     cd "$INSTALL_DIR"
@@ -70,7 +70,7 @@ if [ -n "$SUDO_USER" ]; then
 fi
 echo -e "${GREEN}  ✓ 仓库就绪 ($INSTALL_DIR)${NC}"
 
-echo -e "${YELLOW}[4/6] 安装依赖 (可能需要几分钟)...${NC}"
+echo -e "${YELLOW}[4/7] 安装依赖 (可能需要几分钟)...${NC}"
 cd "$INSTALL_DIR"
 if [ -n "$SUDO_USER" ]; then
     sudo -u "$SUDO_USER" pnpm install --force
@@ -79,7 +79,7 @@ else
 fi
 echo -e "${GREEN}  ✓ 依赖安装完成${NC}"
 
-echo -e "${YELLOW}[5/6] 构建项目...${NC}"
+echo -e "${YELLOW}[5/7] 构建项目...${NC}"
 if [ -n "$SUDO_USER" ]; then
     sudo -u "$SUDO_USER" pnpm build
 else
@@ -87,7 +87,7 @@ else
 fi
 echo -e "${GREEN}  ✓ 构建完成${NC}"
 
-echo -e "${YELLOW}[6/6] 配置 MCP...${NC}"
+echo -e "${YELLOW}[6/7] 配置 MCP...${NC}"
 MCP_ENTRY="$INSTALL_DIR/packages/mcp/dist/index.js"
 CLAUDE_JSON="$REAL_HOME/.claude.json"
 
@@ -169,6 +169,43 @@ if [ -n "$SUDO_USER" ]; then
     chown "$SUDO_USER":"$SUDO_USER" "$CLAUDE_JSON" 2>/dev/null || true
 fi
 
+echo -e "${YELLOW}[7/7] 安装代码上下文策略到用户级 CLAUDE.md...${NC}"
+RULES_SRC="$INSTALL_DIR/rules/code-context-policy.md"
+CLAUDE_MD="$REAL_HOME/.claude/CLAUDE.md"
+BEGIN_MARK="<!-- BEGIN claude-context policy (managed by install.sh — do not edit inside) -->"
+END_MARK="<!-- END claude-context policy -->"
+
+if [ -f "$RULES_SRC" ]; then
+    mkdir -p "$REAL_HOME/.claude"
+    [ -f "$CLAUDE_MD" ] || touch "$CLAUDE_MD"
+
+    # 幂等：先剥离旧的托管块（若存在），再追加最新内容
+    TMP_MD="$(mktemp)"
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+        $0==b {skip=1; next}
+        $0==e {skip=0; next}
+        skip!=1 {print}
+    ' "$CLAUDE_MD" > "$TMP_MD"
+
+    # 去掉剥离后可能残留的尾部空行
+    printf '%s\n' "$(cat "$TMP_MD")" > "$TMP_MD"
+
+    {
+        echo ""
+        echo "$BEGIN_MARK"
+        cat "$RULES_SRC"
+        echo "$END_MARK"
+    } >> "$TMP_MD"
+
+    mv "$TMP_MD" "$CLAUDE_MD"
+    if [ -n "$SUDO_USER" ]; then
+        chown "$SUDO_USER":"$SUDO_USER" "$CLAUDE_MD" 2>/dev/null || true
+    fi
+    echo -e "${GREEN}  ✓ 策略已写入 $CLAUDE_MD（托管块，重复安装自动更新）${NC}"
+else
+    echo -e "${YELLOW}  未找到 $RULES_SRC，跳过策略安装${NC}"
+fi
+
 echo ""
 echo -e "${GREEN}============================================${NC}"
 echo -e "${GREEN}  安装完成！${NC}"
@@ -176,6 +213,7 @@ echo -e "${GREEN}============================================${NC}"
 echo ""
 echo "  安装位置: $INSTALL_DIR"
 echo "  配置文件: $CLAUDE_JSON"
+echo "  上下文策略: $CLAUDE_MD（仅在 claude-context 工具可用的会话生效）"
 echo ""
 echo -e "${YELLOW}  下一步: 重启 Claude Code，输入 /mcp 确认 claude-context 已连接。${NC}"
 echo -e "${YELLOW}  然后在对话框说"索引当前项目"即可开始使用。${NC}"
