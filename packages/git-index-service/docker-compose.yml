@@ -1,0 +1,20 @@
+services:
+  git-index:
+    image: claude-context-git-index:latest
+    container_name: claude-git-index
+    restart: unless-stopped
+    # Run as the host user so cloned repos under ./repos stay owned by haoming.ju
+    # (not root). HOME is set writable for git's config lookups.
+    user: "1015:1015"
+    environment:
+      HOME: /tmp
+    env_file: .env
+    volumes:
+      # Persist local git mirrors across restarts (kept inside the deploy dir).
+      - ./repos:/workdir/repos
+    ports:
+      # HTTP control: GET /health, POST /index (manual trigger). Host 8795 -> container 8790.
+      - "8795:8790"
+    # Milvus/Ollama run as containers on THIS host with ports published on 0.0.0.0;
+    # this bridge container reaches them via the host LAN IP set in .env
+    # (MILVUS_ADDRESS / OLLAMA_HOST = 10.50.4.149:...). No coupling to their networks.

@@ -26,6 +26,21 @@ import { execSync } from 'child_process';
 import { FileSynchronizer } from './sync/synchronizer';
 import { getRepoIdentity } from './utils/git-identity';
 import { matchGlob } from './utils/glob-matcher';
+import {
+    isGitRepo,
+    getHeadCommit,
+    getRepoRoot,
+    getRemoteUrl,
+    getCommitTimestamp,
+    getMergeBase,
+    getRefCommit,
+    commitExists,
+    isAncestor,
+    diffChangedFiles,
+    ChangedFiles,
+} from './utils/git-history';
+import { EmbeddingCache, NoopEmbeddingCache, MilvusEmbeddingCache, hashChunk } from './cache';
+import { CommitIndexState, CommitState } from './index-state';
 
 /**
  * Thrown by indexCodebase / processFileList when an AbortSignal fires
@@ -156,6 +171,22 @@ export class Context {
     /** Cache for getRepoIdentity to avoid repeated git execSync calls in the hot path. */
     private repoIdentityCache: Map<string, string> = new Map();
 
+    // ── Team-version incremental indexing state ──────────────────────
+    /** Shared commit-level index state (identity → last-indexed HEAD commit). */
+    private commitIndexState: CommitIndexState;
+    /** Whether the content-hash embedding cache is enabled (EMBEDDING_CACHE_ENABLED). */
+    private embeddingCacheEnabled: boolean;
+    /** Lazily-built embedding cache, rebuilt when model/dimension changes. */
+    private embeddingCacheInstance: EmbeddingCache | null = null;
+    private embeddingCacheKey: string | null = null;
+    /** Resolved embedding dimension, cached to avoid repeated detectDimension calls. */
+    private knownDimension: number | null = null;
+    /**
+     * HEAD commit stamped onto chunk metadata for the in-flight index run.
+     * Set at the start of indexCodebase/syncIndexByGit; used by processChunkBatch.
+     */
+    private currentIndexCommit: string | null = null;
+
     constructor(config: ContextConfig = {}) {
         // Initialize services
         this.embedding = config.embedding || new OpenAIEmbedding({
@@ -201,6 +232,10 @@ export class Context {
         this.baseIgnorePatterns = this.dedupePatterns(allIgnorePatterns);
         this.ignorePatterns = [...this.baseIgnorePatterns];
         this.collectionNameOverride = config.collectionNameOverride;
+
+        // Team-version: shared commit state + content-hash embedding cache.
+        this.commitIndexState = new CommitIndexState(this.vectorDatabase);
+        this.embeddingCacheEnabled = this.readBoolEnv('EMBEDDING_CACHE_ENABLED', true);
 
         console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
         if (envCustomExtensions.length > 0) {
@@ -303,6 +338,56 @@ export class Context {
     }
 
     /**
+     * Read a boolean env flag with a default. Accepts true/false/1/0 (case-insensitive).
+     */
+    private readBoolEnv(name: string, defaultValue: boolean): boolean {
+        const raw = envManager.get(name);
+        if (raw === undefined || raw === null || String(raw).trim() === '') {
+            return defaultValue;
+        }
+        const v = String(raw).trim().toLowerCase();
+        return v === 'true' || v === '1' || v === 'yes';
+    }
+
+    /**
+     * Resolve the embedding dimension once and cache it. Prefers the provider's
+     * declared dimension, falling back to a live detectDimension() call.
+     */
+    private async resolveDimension(): Promise<number> {
+        if (this.knownDimension && this.knownDimension > 0) {
+            return this.knownDimension;
+        }
+        const declared = this.embedding.getDimension();
+        if (declared && declared > 0) {
+            this.knownDimension = declared;
+            return declared;
+        }
+        const detected = await this.embedding.detectDimension();
+        this.knownDimension = detected;
+        return detected;
+    }
+
+    /**
+     * Get the content-hash embedding cache for the current model + dimension.
+     * Returns a no-op cache when caching is disabled. The instance is rebuilt
+     * whenever the model identifier or dimension changes so vectors never mix
+     * across models.
+     */
+    private getEmbeddingCache(dimension: number): EmbeddingCache {
+        if (!this.embeddingCacheEnabled) {
+            return new NoopEmbeddingCache();
+        }
+        const modelId = this.embedding.getModelIdentifier();
+        const key = `${modelId}#${dimension}`;
+        if (this.embeddingCacheInstance && this.embeddingCacheKey === key) {
+            return this.embeddingCacheInstance;
+        }
+        this.embeddingCacheInstance = new MilvusEmbeddingCache(this.vectorDatabase, modelId, dimension);
+        this.embeddingCacheKey = key;
+        return this.embeddingCacheInstance;
+    }
+
+    /**
      * Cached getRepoIdentity — avoids repeated git execSync calls in the
      * hot path (processChunkBatch is called once per embedding batch,
      * each call to getRepoIdentity runs 2 git commands).
@@ -322,9 +407,16 @@ export class Context {
      * Generate collection name based on codebase path and hybrid mode
      */
     public getCollectionName(codebasePath: string): string {
+        return this.getCollectionNameForIdentity(this.getRepoIdentityCached(codebasePath));
+    }
+
+    /**
+     * Collection name for an arbitrary repo identity (url:branch). Lets the
+     * layered query walk ancestor branches' collections without a checkout path.
+     */
+    public getCollectionNameForIdentity(identity: string): string {
         const isHybrid = this.getIsHybrid();
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
-        const identity = this.getRepoIdentityCached(codebasePath);
         const pathHash = crypto.createHash('md5').update(identity).digest('hex').substring(0, 8);
 
         // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
@@ -401,6 +493,10 @@ export class Context {
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
         const splitter = requestSplitter || this.codeSplitter;
 
+        // Stamp the HEAD commit for this run so chunk metadata records the commit
+        // it was indexed at (and so the commit-state record below is accurate).
+        this.currentIndexCommit = getHeadCommit(codebasePath);
+
         // 1. Compute ignore patterns for this codebase/request without
         // retaining file-based patterns from previous codebases.
         const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
@@ -448,6 +544,19 @@ export class Context {
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
 
+        // Record the commit this full index brought the shared vector index up to,
+        // so subsequent indexing (this dev or a teammate) can go incremental.
+        // A full index is a root layer in the Git-DAG (base = null).
+        if (this.currentIndexCommit && result.status === 'completed') {
+            const identity = this.getRepoIdentityCached(codebasePath);
+            const dimension = await this.resolveDimension();
+            await this.commitIndexState.set(identity, this.currentIndexCommit, dimension, {
+                repoUrl: getRemoteUrl(codebasePath) || undefined,
+                baseIdentity: null,
+                overridePaths: [],
+            });
+        }
+
         progressCallback?.({
             phase: 'Indexing complete!',
             current: result.processedFiles,
@@ -459,6 +568,415 @@ export class Context {
             indexedFiles: result.processedFiles,
             totalChunks: result.totalChunks,
             status: result.status
+        };
+    }
+
+    private readIntEnv(name: string, fallback: number): number {
+        const raw = envManager.get(name);
+        if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+        const v = parseInt(String(raw), 10);
+        return Number.isFinite(v) ? v : fallback;
+    }
+
+    /** Map a git repo-root-relative path onto the index root; null if outside it. */
+    private mapRepoPathToIndex(codebasePath: string, repoRoot: string, gitFile: string): { abs: string; rel: string } | null {
+        const abs = path.resolve(repoRoot, gitFile);
+        const rel = path.relative(codebasePath, abs);
+        if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+        return { abs, rel: rel.replace(/\\/g, '/') };
+    }
+
+    /**
+     * Resolve a branch's lineage against the repository's indexed branches:
+     *   - root   = the search BASE (the repo's main/root branch). Every branch's
+     *              index is stored + queried as `root ⊕ own-diff`, so search only
+     *              ever touches two layers regardless of how deep the branch tree is.
+     *   - parent = the immediate ancestor branch (e.g. C's parent is B). Tracked
+     *              purely for the branch tree; it does NOT affect search.
+     *   - diff / overridePaths = what this branch changed relative to the root
+     *              (since the fork point), used to store the delta and mask the root.
+     * Returns root=null when no indexed ancestor exists → this branch is a root.
+     */
+    private async resolveLineage(
+        codebasePath: string, identity: string, head: string, repoUrl: string,
+    ): Promise<{
+        root: { identity: string; headCommit: string } | null;
+        parentIdentity: string | null;
+        diff: ChangedFiles | null;
+        overridePaths: string[];
+    }> {
+        const empty = { root: null, parentIdentity: null, diff: null, overridePaths: [] as string[] };
+        if (!this.readBoolEnv('GIT_LAYERED_ENABLED', true)) return empty;
+
+        const others = (await this.commitIndexState.getByRepo(repoUrl)).filter(c => c.identity !== identity && !!c.headCommit);
+        if (others.length === 0) return empty;
+
+        // Search root = an indexed ROOT branch (baseIdentity==null), preferring
+        // main/master by name. This is the shared base every branch composes with.
+        const rootPool = others.filter(c => !c.baseIdentity);
+        const pool = rootPool.length > 0 ? rootPool : others;
+        let root = pool.find(c => ['main', 'master'].includes(this.branchOf(c.identity, repoUrl))) || pool[0];
+
+        // Resolve the diff base commit against the developer's LOCAL view of the
+        // root branch (origin/<main> or <main>), so a branch still diffs correctly
+        // even when the exact cloud-indexed commit isn't present locally. Fall back
+        // to the recorded root commit if that exists locally.
+        const rootBranch = this.branchOf(root.identity, repoUrl);
+        let baseCommit: string | null = rootBranch
+            ? (getRefCommit(codebasePath, `origin/${rootBranch}`) || getRefCommit(codebasePath, rootBranch))
+            : null;
+        if (!baseCommit && commitExists(codebasePath, root.headCommit)) baseCommit = root.headCommit;
+        if (!baseCommit) return empty; // can't locate the root locally → index as a full root
+
+        // Diff vs root since the fork point (merge-base) = this branch's own work.
+        const mergeBase = getMergeBase(codebasePath, baseCommit, head) || baseCommit;
+        const diff = diffChangedFiles(codebasePath, mergeBase, head);
+        const repoRoot = getRepoRoot(codebasePath) || codebasePath;
+        const overridePaths: string[] = [];
+        if (diff) {
+            for (const f of [...diff.modified, ...diff.deleted]) {
+                const m = this.mapRepoPathToIndex(codebasePath, repoRoot, f);
+                if (m) overridePaths.push(m.rel);
+            }
+        }
+
+        // Immediate parent for the branch tree = the DEEPEST indexed ancestor whose
+        // commit is present locally (best-effort; falls back to the root).
+        const localAncestors = others.filter(c =>
+            c.headCommit !== head && commitExists(codebasePath, c.headCommit) && isAncestor(codebasePath, c.headCommit, head),
+        );
+        let parentIdentity = root.identity;
+        if (localAncestors.length > 0) {
+            let parent = localAncestors[0];
+            for (let i = 1; i < localAncestors.length; i++) {
+                const c = localAncestors[i];
+                if (isAncestor(codebasePath, parent.headCommit, c.headCommit)) parent = c;
+                else if (!isAncestor(codebasePath, c.headCommit, parent.headCommit)) {
+                    if ((getCommitTimestamp(codebasePath, c.headCommit) ?? 0) > (getCommitTimestamp(codebasePath, parent.headCommit) ?? 0)) parent = c;
+                }
+            }
+            parentIdentity = parent.identity;
+        }
+
+        return {
+            root: { identity: root.identity, headCommit: baseCommit },
+            parentIdentity,
+            diff,
+            overridePaths,
+        };
+    }
+
+    /** Extract the branch name from a `url:branch` identity, given the repo URL. */
+    private branchOf(identity: string, repoUrl: string): string {
+        if (repoUrl && identity.startsWith(repoUrl + ':')) return identity.slice(repoUrl.length + 1);
+        const idx = identity.lastIndexOf(':');
+        return idx >= 0 ? identity.slice(idx + 1) : identity;
+    }
+
+    /** Recompute lineage metadata (base=root, parent, override paths) for state. */
+    private async computeLayerMeta(
+        codebasePath: string, identity: string, head: string, repoUrl: string | null,
+    ): Promise<{ baseIdentity: string | null; parentIdentity: string | null; overridePaths: string[] }> {
+        if (!repoUrl) return { baseIdentity: null, parentIdentity: null, overridePaths: [] };
+        const lineage = await this.resolveLineage(codebasePath, identity, head, repoUrl);
+        return {
+            baseIdentity: lineage.root?.identity ?? null,
+            parentIdentity: lineage.parentIdentity,
+            overridePaths: lineage.overridePaths,
+        };
+    }
+
+    /**
+     * Query layer chain: always at most two layers — [current branch (delta), root
+     * (main)]. The root layer is masked by the files the current branch changed vs
+     * root, so search reflects exactly `main ⊕ this branch's diff`.
+     */
+    private async resolveLayerChain(identity: string): Promise<Array<{ identity: string; collectionName: string; mask: string[] }>> {
+        const self = { identity, collectionName: this.getCollectionNameForIdentity(identity), mask: [] as string[] };
+        const st: CommitState | null = await this.commitIndexState.get(identity);
+        if (!st || !st.baseIdentity || st.baseIdentity === identity) {
+            return [self];
+        }
+        return [
+            self,
+            {
+                identity: st.baseIdentity,
+                collectionName: this.getCollectionNameForIdentity(st.baseIdentity),
+                mask: st.overridePaths || [],
+            },
+        ];
+    }
+
+    /**
+     * First-time index of a branch that has an indexed ancestor: store ONLY the
+     * files changed relative to the base (added + modified), and record the base
+     * pointer + override paths so queries compose base ⊕ delta. The base's copies
+     * of unchanged files are reused as-is; identical chunks hit the embedding cache.
+     */
+    private async indexBranchDelta(
+        codebasePath: string,
+        identity: string,
+        head: string,
+        repoUrl: string,
+        lineage: { root: { identity: string; headCommit: string } | null; parentIdentity: string | null; diff: ChangedFiles | null; overridePaths: string[] },
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void | Promise<void>,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter,
+        signal?: AbortSignal,
+    ): Promise<{
+        mode: 'delta';
+        indexedFiles: number;
+        totalChunks: number;
+        added: number;
+        modified: number;
+        removed: number;
+        baseIdentity: string;
+        status: 'completed' | 'limit_reached';
+    }> {
+        const root = lineage.root!;
+        const diff = lineage.diff!;
+        const repoRoot = getRepoRoot(codebasePath) || codebasePath;
+        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
+
+        // Files this branch changed vs root (main) → mask root's versions at query time.
+        const overridePaths = lineage.overridePaths;
+
+        // Files to actually embed for this branch: added + modified (existing, indexable).
+        // This is the branch's full diff vs main, so C (cut from B) stores B's changes
+        // plus its own — cumulative, but identical chunks hit the embedding cache.
+        const indexAbsPaths: string[] = [];
+        for (const f of [...diff.added, ...diff.modified]) {
+            const m = this.mapRepoPathToIndex(codebasePath, repoRoot, f);
+            if (!m) continue;
+            if (!fs.existsSync(m.abs)) continue;
+            if (!supportedExtensions.includes(path.extname(m.rel))) continue;
+            if (this.matchesIgnorePattern(m.abs, codebasePath, ignorePatterns)) continue;
+            indexAbsPaths.push(m.abs);
+        }
+
+        console.log(`[Context] 🌿 Branch delta index for ${identity}: base(root)=${root.identity}, parent=${lineage.parentIdentity} (+${diff.added.length}/~${diff.modified.length}/-${diff.deleted.length})`);
+
+        // Fresh delta collection (parent pointer embedded in description for the Attu tree).
+        await this.prepareCollection(codebasePath, false, lineage.parentIdentity);
+        this.currentIndexCommit = head;
+
+        let processed = { processedFiles: 0, totalChunks: 0, status: 'completed' as 'completed' | 'limit_reached' };
+        if (indexAbsPaths.length > 0) {
+            processed = await this.processFileList(
+                indexAbsPaths,
+                codebasePath,
+                (filePath, fileIndex, totalFiles) => {
+                    progressCallback?.({
+                        phase: `Indexing branch delta (${fileIndex}/${totalFiles})...`,
+                        current: fileIndex,
+                        total: totalFiles,
+                        percentage: Math.round((fileIndex / totalFiles) * 100),
+                    });
+                },
+                requestSplitter || this.codeSplitter,
+                signal,
+            );
+        }
+
+        const dim = await this.resolveDimension();
+        await this.commitIndexState.set(identity, head, dim, {
+            repoUrl,
+            baseIdentity: root.identity,
+            parentIdentity: lineage.parentIdentity,
+            overridePaths,
+        });
+        progressCallback?.({ phase: 'Branch delta indexing complete!', current: 100, total: 100, percentage: 100 });
+
+        return {
+            mode: 'delta',
+            indexedFiles: processed.processedFiles,
+            totalChunks: processed.totalChunks,
+            added: diff.added.length,
+            modified: diff.modified.length,
+            removed: diff.deleted.length,
+            baseIdentity: root.identity,
+            status: processed.status,
+        };
+    }
+
+    /**
+     * Git-driven incremental indexing (team-version core).
+     *
+     * Instead of always rescanning the whole repository, this compares the
+     * commit the shared index is currently at (from CommitIndexState) with the
+     * working tree's HEAD and processes only the changed files. First-time
+     * indexing of a branch that has an indexed ancestor stores only the delta
+     * relative to that base (Git-DAG layering); a branch with no ancestor is a
+     * root and is fully indexed.
+     *
+     * Non-git repositories transparently fall back to a full `indexCodebase`.
+     */
+    async syncIndexByGit(
+        codebasePath: string,
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void | Promise<void>,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter,
+        signal?: AbortSignal
+    ): Promise<{
+        mode: 'full' | 'delta' | 'incremental' | 'up-to-date';
+        indexedFiles: number;
+        totalChunks: number;
+        added: number;
+        modified: number;
+        removed: number;
+        baseIdentity?: string | null;
+        status: 'completed' | 'limit_reached';
+    }> {
+        const gitEnabled = this.readBoolEnv('GIT_INCREMENTAL_ENABLED', true) && isGitRepo(codebasePath);
+        const layeredEnabled = this.readBoolEnv('GIT_LAYERED_ENABLED', true);
+        const head = gitEnabled ? getHeadCommit(codebasePath) : null;
+        const identity = this.getRepoIdentityCached(codebasePath);
+        const repoUrl = gitEnabled ? getRemoteUrl(codebasePath) : null;
+
+        const doFull = async (force: boolean) => {
+            const stats = await this.indexCodebase(
+                codebasePath, progressCallback, force,
+                additionalIgnorePatterns, additionalSupportedExtensions, requestSplitter, signal
+            );
+            return {
+                mode: 'full' as const,
+                indexedFiles: stats.indexedFiles,
+                totalChunks: stats.totalChunks,
+                added: stats.indexedFiles,
+                modified: 0,
+                removed: 0,
+                baseIdentity: null,
+                status: stats.status,
+            };
+        };
+
+        // Not a git repo (or git unavailable) → preserve existing full-index behavior.
+        if (!gitEnabled || !head) {
+            console.log(`[Context] Git incremental unavailable for ${codebasePath}; running full index.`);
+            return doFull(false);
+        }
+
+        const collectionExists = await this.hasIndex(codebasePath);
+        const state = await this.commitIndexState.get(identity);
+
+        // First index of this branch: if it has an indexed ancestor, store only the
+        // delta relative to that base (Git-DAG layering); otherwise it is a root and
+        // is fully indexed.
+        if (!collectionExists || !state || !state.headCommit) {
+            if (layeredEnabled && repoUrl) {
+                const lineage = await this.resolveLineage(codebasePath, identity, head, repoUrl);
+                const maxDelta = Math.max(1, this.readIntEnv('GIT_DELTA_MAX_FILES', 2000));
+                if (lineage.root && lineage.diff) {
+                    const diff = lineage.diff;
+                    const changedCount = diff.added.length + diff.modified.length + diff.deleted.length;
+                    if (changedCount <= maxDelta) {
+                        return await this.indexBranchDelta(
+                            codebasePath, identity, head, repoUrl, lineage,
+                            progressCallback, additionalIgnorePatterns, additionalSupportedExtensions, requestSplitter, signal,
+                        );
+                    }
+                    console.log(`[Context] Delta vs root ${lineage.root.identity} too large (${changedCount} > ${maxDelta}); indexing as full root.`);
+                }
+            }
+            return doFull(false);
+        }
+
+        const diff = diffChangedFiles(codebasePath, state.headCommit, head);
+        if (!diff) {
+            // Base commit unreachable (history rewrite / shallow clone) → safe full reindex.
+            console.warn(`[Context] Cannot diff ${state.headCommit.slice(0, 8)}..${head.slice(0, 8)}; doing a full reindex.`);
+            return doFull(true);
+        }
+
+        // Map git's repo-root-relative paths onto the (possibly nested) index root.
+        const repoRoot = getRepoRoot(codebasePath) || codebasePath;
+        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
+
+        const toIndexPath = (gitFile: string): { abs: string; rel: string } | null => {
+            const abs = path.resolve(repoRoot, gitFile);
+            const rel = path.relative(codebasePath, abs);
+            if (rel.startsWith('..') || path.isAbsolute(rel)) return null; // outside index root
+            return { abs, rel: rel.replace(/\\/g, '/') };
+        };
+
+        // Chunks for modified + deleted files must be removed first.
+        const deletePaths = new Set<string>();
+        for (const f of [...diff.modified, ...diff.deleted]) {
+            const m = toIndexPath(f);
+            if (m) deletePaths.add(m.rel);
+        }
+
+        // Added + modified files that still exist and pass ext/ignore filters get (re)indexed.
+        const indexAbsPaths: string[] = [];
+        for (const f of [...diff.added, ...diff.modified]) {
+            const m = toIndexPath(f);
+            if (!m) continue;
+            if (!fs.existsSync(m.abs)) continue;
+            if (!supportedExtensions.includes(path.extname(m.rel))) continue;
+            if (this.matchesIgnorePattern(m.abs, codebasePath, ignorePatterns)) continue;
+            indexAbsPaths.push(m.abs);
+        }
+
+        // Nothing changed within the index root → fast-forward state, no work.
+        if (deletePaths.size === 0 && indexAbsPaths.length === 0) {
+            console.log(`[Context] ✅ Index already up to date for ${identity} @ ${head.slice(0, 8)}`);
+            progressCallback?.({ phase: 'Already up to date', current: 100, total: 100, percentage: 100 });
+            const dim = await this.resolveDimension();
+            const meta = await this.computeLayerMeta(codebasePath, identity, head, repoUrl);
+            await this.commitIndexState.set(identity, head, dim, { repoUrl: repoUrl || undefined, ...meta });
+            return { mode: 'up-to-date', indexedFiles: 0, totalChunks: 0, added: 0, modified: 0, removed: 0, baseIdentity: meta.baseIdentity, status: 'completed' };
+        }
+
+        console.log(`[Context] 🔄 Git incremental: ${diff.added.length} added, ${diff.modified.length} modified, ${diff.deleted.length} deleted (base ${state.headCommit.slice(0, 8)} → ${head.slice(0, 8)})`);
+
+        // Collection should already exist; ensure it in case of drift (no force).
+        await this.prepareCollection(codebasePath, false);
+        this.currentIndexCommit = head;
+
+        const collectionName = this.getCollectionName(codebasePath);
+        progressCallback?.({ phase: 'Removing changed/deleted file chunks...', current: 0, total: 100, percentage: 0 });
+        for (const rel of deletePaths) {
+            await this.deleteFileChunks(collectionName, rel);
+        }
+
+        let processed = { processedFiles: 0, totalChunks: 0, status: 'completed' as 'completed' | 'limit_reached' };
+        if (indexAbsPaths.length > 0) {
+            processed = await this.processFileList(
+                indexAbsPaths,
+                codebasePath,
+                (filePath, fileIndex, totalFiles) => {
+                    progressCallback?.({
+                        phase: `Indexing changed files (${fileIndex}/${totalFiles})...`,
+                        current: fileIndex,
+                        total: totalFiles,
+                        percentage: Math.round((fileIndex / totalFiles) * 100),
+                    });
+                },
+                requestSplitter || this.codeSplitter,
+                signal
+            );
+        }
+
+        // Advance the shared state to HEAD only after the delta is applied, and
+        // refresh the base pointer + override paths for the layered query.
+        const dim = await this.resolveDimension();
+        const meta = await this.computeLayerMeta(codebasePath, identity, head, repoUrl);
+        await this.commitIndexState.set(identity, head, dim, { repoUrl: repoUrl || undefined, ...meta });
+        progressCallback?.({ phase: 'Incremental indexing complete!', current: 100, total: 100, percentage: 100 });
+
+        return {
+            mode: 'incremental',
+            indexedFiles: processed.processedFiles,
+            totalChunks: processed.totalChunks,
+            added: diff.added.length,
+            modified: diff.modified.length,
+            removed: diff.deleted.length,
+            baseIdentity: meta.baseIdentity,
+            status: processed.status,
         };
     }
 
@@ -568,102 +1086,189 @@ export class Context {
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
 
-        const collectionName = this.getCollectionName(codebasePath);
-        console.log(`[Context] 🔍 Using collection: ${collectionName}`);
+        // Build the Git-DAG layer chain: [current branch (delta), base, base-of-base, …].
+        // A branch with no base yields a single layer → identical to the classic
+        // single-collection search.
+        const identity = this.getRepoIdentityCached(codebasePath);
+        let layers = await this.resolveLayerChain(identity);
+        if (layers.length === 0) {
+            layers = [{ identity, collectionName: this.getCollectionName(codebasePath), mask: [] }];
+        }
 
-        // Check if collection exists and has data
-        const hasCollection = await this.vectorDatabase.hasCollection(collectionName);
-        if (!hasCollection) {
-            console.log(`[Context] ⚠️  Collection '${collectionName}' does not exist. Please index the codebase first.`);
+        // Keep only layers whose collection actually exists — checked concurrently.
+        const existence = await Promise.all(
+            layers.map(l => this.vectorDatabase.hasCollection(l.collectionName).catch(() => false)),
+        );
+        const activeLayers = layers.filter((_, i) => existence[i]);
+        if (activeLayers.length === 0) {
+            console.log(`[Context] ⚠️  No indexed layer collection exists for '${identity}'. Please index the codebase first.`);
             return [];
         }
 
+        // Query embedding is computed once and reused across all layers.
+        const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+
+        // Multi-layer hybrid → true global fusion: pull raw dense + raw sparse hits
+        // from every layer and fuse them with a single unified RRF (dense ranked
+        // globally by cosine across layers, sparse ranked within each layer since
+        // BM25 scores aren't comparable across collections). This is more accurate
+        // than letting each layer RRF-fuse itself and then merging fused scores.
+        if (isHybrid && activeLayers.length > 1 && typeof this.vectorDatabase.sparseSearch === 'function') {
+            const fused = await this.globalHybridFusion(activeLayers, queryEmbedding.vector, query, topK, filterExpr);
+            console.log(`[Context] ✅ Global-RRF ${searchType} over ${activeLayers.length} layers → ${fused.length} results`);
+            return fused;
+        }
+
+        // Overlay search: Main and Branch (and any base) are queried CONCURRENTLY,
+        // not serially. Each layer masks the files a nearer layer overrides so the
+        // base's stale chunks never surface (Branch overrides Main), then all hits
+        // are fused and globally re-ranked below.
+        const perLayer = await Promise.all(
+            activeLayers.map(layer => {
+                const layerFilter = this.combineFilters(filterExpr, this.buildMaskFilter(layer.mask));
+                return this.searchLayer(
+                    layer.collectionName, queryEmbedding.vector, query, topK, threshold, layerFilter, isHybrid,
+                ).catch(error => {
+                    console.warn(`[Context] ⚠️  Layer search failed for '${layer.collectionName}' (skipping): ${error}`);
+                    return [] as SemanticSearchResult[];
+                });
+            }),
+        );
+
+        // Global re-rank across layers: highest score first, drop overlapping duplicates, cap at topK.
+        const all: SemanticSearchResult[] = perLayer.flat();
+        all.sort((a, b) => b.score - a.score);
+        const deduped = this.deduplicateResults(all);
+        deduped.sort((a, b) => b.score - a.score);
+        const finalResults = deduped.slice(0, topK);
+        console.log(`[Context] ✅ Layered ${searchType} over ${activeLayers.length} layer(s): ${all.length} raw → ${finalResults.length} results`);
+        return finalResults;
+    }
+
+    /** Execute one collection's search (hybrid or dense) → normalized results. */
+    private async searchLayer(
+        collectionName: string,
+        queryVector: number[],
+        queryText: string,
+        topK: number,
+        threshold: number,
+        filterExpr: string | undefined,
+        isHybrid: boolean,
+    ): Promise<SemanticSearchResult[]> {
+        const toResult = (document: VectorDocument, score: number): SemanticSearchResult => ({
+            content: document.content,
+            relativePath: document.relativePath,
+            startLine: document.startLine,
+            endLine: document.endLine,
+            language: document.metadata.language || 'unknown',
+            score,
+        });
+
         if (isHybrid === true) {
-            // 1. Generate query vector
-            console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
-            console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
-            console.log(`[Context] 🔍 First 5 embedding values: [${queryEmbedding.vector.slice(0, 5).join(', ')}]`);
-
-            // 2. Prepare hybrid search requests
             const searchRequests: HybridSearchRequest[] = [
-                {
-                    data: queryEmbedding.vector,
-                    anns_field: "vector",
-                    param: { "nprobe": 10 },
-                    limit: topK
-                },
-                {
-                    data: query,
-                    anns_field: "sparse_vector",
-                    param: { "drop_ratio_search": 0.2 },
-                    limit: topK
-                }
+                { data: queryVector, anns_field: 'vector', param: { nprobe: 10 }, limit: topK },
+                { data: queryText, anns_field: 'sparse_vector', param: { drop_ratio_search: 0.2 }, limit: topK },
             ];
-
-            console.log(`[Context] 🔍 Search request 1 (dense): anns_field="${searchRequests[0].anns_field}", vector_dim=${queryEmbedding.vector.length}, limit=${searchRequests[0].limit}`);
-            console.log(`[Context] 🔍 Search request 2 (sparse): anns_field="${searchRequests[1].anns_field}", query_text="${query}", limit=${searchRequests[1].limit}`);
-
-            // 3. Execute hybrid search
-            console.log(`[Context] 🔍 Executing hybrid search with RRF reranking...`);
             const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
                 collectionName,
                 searchRequests,
-                {
-                    rerank: {
-                        strategy: 'rrf',
-                        params: { k: 100 }
-                    },
-                    limit: topK,
-                    filterExpr
-                }
+                { rerank: { strategy: 'rrf', params: { k: 100 } }, limit: topK, filterExpr },
             );
-
-            console.log(`[Context] 🔍 Raw search results count: ${searchResults.length}`);
-
-            // 4. Convert to semantic search result format
-            const results: SemanticSearchResult[] = searchResults.map(result => ({
-                content: result.document.content,
-                relativePath: result.document.relativePath,
-                startLine: result.document.startLine,
-                endLine: result.document.endLine,
-                language: result.document.metadata.language || 'unknown',
-                score: result.score
-            }));
-
-            const dedupedResults = this.deduplicateResults(results);
-            console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
-            if (dedupedResults.length > 0) {
-                console.log(`[Context] 🔍 Top result score: ${dedupedResults[0].score}, path: ${dedupedResults[0].relativePath}`);
-            }
-
-            return dedupedResults;
-        } else {
-            // Regular semantic search
-            // 1. Generate query vector
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
-
-            // 2. Search in vector database
-            const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
-                collectionName,
-                queryEmbedding.vector,
-                { topK, threshold, filterExpr }
-            );
-
-            // 3. Convert to semantic search result format
-            const results: SemanticSearchResult[] = searchResults.map(result => ({
-                content: result.document.content,
-                relativePath: result.document.relativePath,
-                startLine: result.document.startLine,
-                endLine: result.document.endLine,
-                language: result.document.metadata.language || 'unknown',
-                score: result.score
-            }));
-
-            const dedupedResults = this.deduplicateResults(results);
-            console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
-            return dedupedResults;
+            return searchResults.map(r => toResult(r.document, r.score));
         }
+        const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
+            collectionName, queryVector, { topK, threshold, filterExpr },
+        );
+        return searchResults.map(r => toResult(r.document, r.score));
+    }
+
+    /**
+     * Cross-layer global hybrid fusion. Pulls raw dense (cosine) and raw sparse
+     * (BM25) hits from every layer, then fuses with one unified RRF:
+     *   - dense: ranked GLOBALLY across all layers (cosine is comparable in one
+     *     embedding space), so a strong branch hit and a strong main hit compete
+     *     on equal footing.
+     *   - sparse: ranked WITHIN each layer (BM25 scores are corpus-relative and
+     *     not comparable across collections), contributed as independent RRF lists.
+     * A document lives in exactly one layer (branch overrides main via masking),
+     * so its final score = 1/(k+globalDenseRank) + 1/(k+layerSparseRank).
+     */
+    private async globalHybridFusion(
+        activeLayers: Array<{ identity: string; collectionName: string; mask: string[] }>,
+        queryVector: number[],
+        queryText: string,
+        topK: number,
+        filterExpr?: string,
+    ): Promise<SemanticSearchResult[]> {
+        const sparseSearch = this.vectorDatabase.sparseSearch!.bind(this.vectorDatabase);
+        const RRF_K = 100;
+
+        const perLayer = await Promise.all(activeLayers.map(async layer => {
+            const f = this.combineFilters(filterExpr, this.buildMaskFilter(layer.mask));
+            const [dense, sparse] = await Promise.all([
+                this.vectorDatabase.search(layer.collectionName, queryVector, { topK, filterExpr: f })
+                    .catch(e => { console.warn(`[Context] ⚠️  Dense search failed for '${layer.collectionName}': ${e}`); return [] as VectorSearchResult[]; }),
+                sparseSearch(layer.collectionName, queryText, { topK, filterExpr: f })
+                    .catch(e => { console.warn(`[Context] ⚠️  Sparse search failed for '${layer.collectionName}': ${e}`); return [] as VectorSearchResult[]; }),
+            ]);
+            return { dense, sparse };
+        }));
+
+        // Global dense ranking (cosine desc, comparable across layers).
+        const denseRank = new Map<string, number>();
+        perLayer.flatMap(p => p.dense)
+            .sort((a, b) => b.score - a.score)
+            .forEach((r, i) => { if (!denseRank.has(r.document.id)) denseRank.set(r.document.id, i + 1); });
+
+        // Per-layer sparse ranking (rank within the layer that produced the hit).
+        const sparseRank = new Map<string, number>();
+        for (const p of perLayer) {
+            p.sparse.forEach((r, i) => { if (!sparseRank.has(r.document.id)) sparseRank.set(r.document.id, i + 1); });
+        }
+
+        // Collect each candidate document once (a doc exists in a single layer).
+        const docs = new Map<string, VectorDocument>();
+        for (const p of perLayer) {
+            for (const r of p.dense) if (!docs.has(r.document.id)) docs.set(r.document.id, r.document);
+            for (const r of p.sparse) if (!docs.has(r.document.id)) docs.set(r.document.id, r.document);
+        }
+
+        const scored: SemanticSearchResult[] = [];
+        for (const [id, doc] of docs) {
+            let score = 0;
+            const dr = denseRank.get(id);
+            if (dr !== undefined) score += 1 / (RRF_K + dr);
+            const sr = sparseRank.get(id);
+            if (sr !== undefined) score += 1 / (RRF_K + sr);
+            scored.push({
+                content: doc.content,
+                relativePath: doc.relativePath,
+                startLine: doc.startLine,
+                endLine: doc.endLine,
+                language: doc.metadata.language || 'unknown',
+                score,
+            });
+        }
+
+        scored.sort((a, b) => b.score - a.score);
+        const deduped = this.deduplicateResults(scored);
+        deduped.sort((a, b) => b.score - a.score);
+        return deduped.slice(0, topK);
+    }
+
+    /** Build a `relativePath not in [...]` expression to mask base-layer files. */
+    private buildMaskFilter(mask: string[]): string | undefined {
+        if (!mask || mask.length === 0) return undefined;
+        const quoted = mask.map(p => `"${p.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join(', ');
+        return `relativePath not in [${quoted}]`;
+    }
+
+    /** AND-combine two optional Milvus filter expressions. */
+    private combineFilters(a?: string, b?: string): string | undefined {
+        const parts = [a, b].filter((x): x is string => !!x && x.trim().length > 0);
+        if (parts.length === 0) return undefined;
+        if (parts.length === 1) return parts[0];
+        return parts.map(p => `(${p})`).join(' and ');
     }
 
     /**
@@ -736,6 +1341,15 @@ export class Context {
             await this.vectorDatabase.dropCollection(collectionName);
         }
 
+        // Remove the shared commit-state record so a later index starts fresh
+        // (full) rather than trying to diff against a now-dropped collection.
+        try {
+            const identity = this.getRepoIdentityCached(codebasePath);
+            await this.commitIndexState.remove(identity);
+        } catch (error) {
+            console.warn(`[Context] ⚠️ Failed to remove commit state during clear (non-fatal): ${error}`);
+        }
+
         // Delete snapshot file
         await FileSynchronizer.deleteSnapshot(codebasePath);
 
@@ -784,6 +1398,11 @@ export class Context {
      */
     updateEmbedding(embedding: Embedding): void {
         this.embedding = embedding;
+        // Model changed → invalidate cached dimension and embedding-cache instance
+        // so we never key vectors under the wrong model/dimension.
+        this.knownDimension = null;
+        this.embeddingCacheInstance = null;
+        this.embeddingCacheKey = null;
         console.log(`[Context] 🔄 Updated embedding provider: ${embedding.getProvider()}`);
     }
 
@@ -793,6 +1412,10 @@ export class Context {
      */
     updateVectorDatabase(vectorDatabase: VectorDatabase): void {
         this.vectorDatabase = vectorDatabase;
+        // Rebind team-version state to the new backend.
+        this.commitIndexState = new CommitIndexState(vectorDatabase);
+        this.embeddingCacheInstance = null;
+        this.embeddingCacheKey = null;
         console.log(`[Context] 🔄 Updated vector database`);
     }
 
@@ -808,7 +1431,7 @@ export class Context {
     /**
      * Prepare vector collection
      */
-    private async prepareCollection(codebasePath: string, forceReindex: boolean = false): Promise<void> {
+    private async prepareCollection(codebasePath: string, forceReindex: boolean = false, parentIdentity?: string | null): Promise<void> {
         const isHybrid = this.getIsHybrid();
         const collectionType = isHybrid === true ? 'hybrid vector' : 'vector';
         console.log(`[Context] 🔧 Preparing ${collectionType} collection for codebase: ${codebasePath}${forceReindex ? ' (FORCE REINDEX)' : ''}`);
@@ -826,6 +1449,9 @@ export class Context {
         // if dimension detection fails (e.g. invalid API key, network error)
         console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
         const dimension = await this.embedding.detectDimension();
+        // Cache the detected dimension so the embedding cache collection is keyed
+        // with the exact same dimension as the code collection.
+        this.knownDimension = dimension;
         console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
 
         if (collectionExists && forceReindex) {
@@ -834,11 +1460,15 @@ export class Context {
             console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
         }
         const repoIdentity = this.getRepoIdentityCached(codebasePath);
+        // Encode the immediate parent branch in the description so Attu can
+        // reconstruct the branch-tracking tree (A ← B ← C). Keeps the
+        // `codebasePath:` prefix that cloud-sync parses; parent appended after `|`.
+        const description = `codebasePath:${repoIdentity}|parent:${parentIdentity || ''}`;
 
         if (isHybrid === true) {
-            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${repoIdentity}`);
+            await this.vectorDatabase.createHybridCollection(collectionName, dimension, description);
         } else {
-            await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${repoIdentity}`);
+            await this.vectorDatabase.createCollection(collectionName, dimension, description);
         }
 
         console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);
@@ -1054,21 +1684,54 @@ export class Context {
     private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
         const isHybrid = this.getIsHybrid();
         const repoIdentity = this.getRepoIdentityCached(codebasePath);
+        const commit = this.currentIndexCommit || '';
 
-        // Generate embedding vectors
-        const chunkContents = chunks.map(chunk => chunk.content);
+        // ── Content-hash embedding cache ──────────────────────────────
+        // Hash every chunk, reuse any vectors already computed (by this repo,
+        // another branch, or a teammate), and only call the embedding model for
+        // genuine cache misses. This is the PRD's Embedding Deduplication: the
+        // expensive vectorization runs once per unique chunk content.
+        const hashes = chunks.map(chunk => hashChunk(chunk.content));
+        const dimension = await this.resolveDimension();
+        const cache = this.getEmbeddingCache(dimension);
+        const cached = await cache.getMany(hashes);
 
-        let embeddings: EmbeddingVector[];
-        try {
-            embeddings = await this.embedding.embedBatch(chunkContents);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            // Include batch size in the log/error message so operators can
-            // identify how many chunks were lost when the API call failed.
-            console.error(`[Context] ❌ Embedding API failed (batch size: ${chunkContents.length}): ${errorMessage}`);
-            throw new EmbeddingError(`Embedding API error (batch size: ${chunkContents.length}): ${errorMessage}`);
+        const vectors: number[][] = new Array(chunks.length);
+        const missIndices: number[] = [];
+        for (let i = 0; i < chunks.length; i++) {
+            const hit = cached.get(hashes[i]);
+            if (hit) {
+                vectors[i] = hit;
+            } else {
+                missIndices.push(i);
+            }
         }
-        this.validateEmbeddings(embeddings, chunks.length);
+
+        if (missIndices.length > 0) {
+            const missContents = missIndices.map(i => chunks[i].content);
+            let missEmbeddings: EmbeddingVector[];
+            try {
+                missEmbeddings = await this.embedding.embedBatch(missContents);
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                // Include batch size in the log/error message so operators can
+                // identify how many chunks were lost when the API call failed.
+                console.error(`[Context] ❌ Embedding API failed (batch size: ${missContents.length}): ${errorMessage}`);
+                throw new EmbeddingError(`Embedding API error (batch size: ${missContents.length}): ${errorMessage}`);
+            }
+            this.validateEmbeddings(missEmbeddings, missIndices.length);
+
+            const toCache: Array<{ hash: string; vector: number[] }> = [];
+            for (let k = 0; k < missIndices.length; k++) {
+                const idx = missIndices[k];
+                vectors[idx] = missEmbeddings[k].vector;
+                toCache.push({ hash: hashes[idx], vector: missEmbeddings[k].vector });
+            }
+            // Persist freshly-computed vectors for future reuse (non-fatal on failure).
+            await cache.setMany(toCache);
+        }
+
+        console.log(`[Context] 🧠 Embedding cache: ${cached.size} hit / ${missIndices.length} miss (batch of ${chunks.length})`);
 
         if (isHybrid === true) {
             // Create hybrid vector documents
@@ -1084,7 +1747,7 @@ export class Context {
                 return {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
                     content: chunk.content, // Full text content for BM25 and storage
-                    vector: embeddings[index].vector, // Dense vector
+                    vector: vectors[index], // Dense vector (cached or freshly embedded)
                     relativePath,
                     startLine: chunk.metadata.startLine || 0,
                     endLine: chunk.metadata.endLine || 0,
@@ -1093,7 +1756,9 @@ export class Context {
                         ...restMetadata,
                         codebasePath: repoIdentity, // 这里替换成 url:branch
                         language: chunk.metadata.language || 'unknown',
-                        chunkIndex: index
+                        chunkIndex: index,
+                        chunkHash: hashes[index], // content hash for dedup / cache
+                        commit // HEAD commit this chunk was indexed at
                     }
                 };
             });
@@ -1113,7 +1778,7 @@ export class Context {
 
                 return {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
-                    vector: embeddings[index].vector,
+                    vector: vectors[index], // Dense vector (cached or freshly embedded)
                     content: chunk.content,
                     relativePath,
                     startLine: chunk.metadata.startLine || 0,
@@ -1123,7 +1788,9 @@ export class Context {
                         ...restMetadata,
                         codebasePath: repoIdentity, // 这里替换成 url:branch
                         language: chunk.metadata.language || 'unknown',
-                        chunkIndex: index
+                        chunkIndex: index,
+                        chunkHash: hashes[index], // content hash for dedup / cache
+                        commit // HEAD commit this chunk was indexed at
                     }
                 };
             });

@@ -111,6 +111,14 @@ export interface VectorDatabase {
     hybridSearch(collectionName: string, searchRequests: HybridSearchRequest[], options?: HybridSearchOptions): Promise<HybridSearchResult[]>;
 
     /**
+     * BM25-only (sparse) search over the text query, ranked by lexical score.
+     * Optional: implementations without a sparse field may omit it; callers that
+     * need per-modality rankings (e.g. cross-layer global RRF fusion) fall back
+     * to hybridSearch when this is absent.
+     */
+    sparseSearch?(collectionName: string, queryText: string, options?: SearchOptions): Promise<VectorSearchResult[]>;
+
+    /**
      * Delete documents
      * @param collectionName Collection name
      * @param ids Document ID array

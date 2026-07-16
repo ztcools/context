@@ -73,4 +73,14 @@ export abstract class Embedding {
      * @returns Provider name
      */
     abstract getProvider(): string;
-} 
+
+    /**
+     * Stable identifier for the concrete embedding model, used to key the shared
+     * embedding cache so vectors from different models/providers never collide.
+     * Subclasses that expose a model name should override this to include it
+     * (e.g. `openai:text-embedding-3-small`). Defaults to the provider name.
+     */
+    getModelIdentifier(): string {
+        return this.getProvider();
+    }
+}

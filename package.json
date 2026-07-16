@@ -9,6 +9,7 @@
         "build:graph": "pnpm --filter @seeway/claude-context-graph build",
         "build:vscode": "pnpm --filter semanticcodesearch compile",
         "build:mcp": "pnpm --filter @seeway/claude-context-mcp build",
+        "build:git-index-service": "pnpm --filter @seeway/claude-context-git-index-service build",
         "dev": "pnpm -r dev",
         "dev:core": "pnpm --filter @seeway/claude-context-core dev",
         "dev:vscode": "pnpm --filter semanticcodesearch watch",

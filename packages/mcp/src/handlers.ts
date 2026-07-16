@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity, envManager } from "@seeway/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity, isGitRepo, envManager } from "@seeway/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, CodebaseInfoIndexFailed, CodebaseInfoIndexing, CodebaseInfoIndexed, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
@@ -227,7 +227,10 @@ export class ToolHandlers {
             try {
                 const description = await vectorDb.getCollectionDescription(collectionName);
                 if (description && description.startsWith('codebasePath:')) {
-                    const codebasePath = description.substring('codebasePath:'.length);
+                    // Description format: `codebasePath:<identity>` optionally followed by
+                    // `|parent:<parentIdentity>` (Git-DAG tree). Take the identity part.
+                    const rawPath = description.substring('codebasePath:'.length);
+                    const codebasePath = rawPath.split('|')[0];
                     if (codebasePath.length > 0) {
                         console.log(`[SYNC-CLOUD] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
                         return { codebasePath };
@@ -541,6 +544,13 @@ export class ToolHandlers {
             const codebaseIdentity = getRepoIdentity(absolutePath);
             console.log(`[IDENTITY] Codebase identity: ${codebaseIdentity} (path: ${absolutePath})`);
 
+            // Git-incremental is available for real git repos unless explicitly disabled.
+            // When available, an "already indexed" repo is NOT an error — we re-enter
+            // background indexing and let syncIndexByGit apply only the git delta.
+            const gitIncrementalEnabled =
+                String(envManager.get('GIT_INCREMENTAL_ENABLED') ?? 'true').toLowerCase() !== 'false' &&
+                isGitRepo(absolutePath);
+
             // Validate path exists
             if (!fs.existsSync(absolutePath)) {
                 return {
@@ -584,26 +594,31 @@ export class ToolHandlers {
                         }
                     }
 
-                    // Check if this is a different local path for the same identity
-                    const existingInfo = this.snapshotManager.getCodebaseInfo(codebaseIdentity);
-                    const existingLocalPath = existingInfo?.localPath;
-                    const isSameLocalPath = existingLocalPath && path.resolve(existingLocalPath) === path.resolve(absolutePath);
+                    // Git repo → don't error out; fall through to background indexing,
+                    // where syncIndexByGit re-uses the shared index and applies only
+                    // the git delta (or reports "up to date" when HEAD is unchanged).
+                    if (!gitIncrementalEnabled) {
+                        const existingInfo = this.snapshotManager.getCodebaseInfo(codebaseIdentity);
+                        const existingLocalPath = existingInfo?.localPath;
+                        const isSameLocalPath = existingLocalPath && path.resolve(existingLocalPath) === path.resolve(absolutePath);
 
-                    let alreadyMessage = `Repository '${codebaseIdentity}' is already indexed.`;
-                    if (!isSameLocalPath && existingLocalPath) {
-                        alreadyMessage += `\nExisting index is for local checkout at: ${existingLocalPath}`;
-                        alreadyMessage += `\nCurrent path: ${absolutePath}`;
-                        alreadyMessage += `\n\nBoth paths map to the same repository (url+branch), so the index is shared. Use force=true to re-index.`;
-                    } else {
-                        alreadyMessage += ` Use force=true to re-index.`;
+                        let alreadyMessage = `Repository '${codebaseIdentity}' is already indexed.`;
+                        if (!isSameLocalPath && existingLocalPath) {
+                            alreadyMessage += `\nExisting index is for local checkout at: ${existingLocalPath}`;
+                            alreadyMessage += `\nCurrent path: ${absolutePath}`;
+                            alreadyMessage += `\n\nBoth paths map to the same repository (url+branch), so the index is shared. Use force=true to re-index.`;
+                        } else {
+                            alreadyMessage += ` Use force=true to re-index.`;
+                        }
+                        return {
+                            content: [{
+                                type: "text",
+                                text: alreadyMessage
+                            }],
+                            isError: true
+                        };
                     }
-                    return {
-                        content: [{
-                            type: "text",
-                            text: alreadyMessage
-                        }],
-                        isError: true
-                    };
+                    console.log(`[IDENTITY-CHECK] '${codebaseIdentity}' already indexed; git repo → will run incremental sync.`);
                 }
             }
 
@@ -659,8 +674,10 @@ export class ToolHandlers {
                 }
             }
 
-            // Check if already indexed (compare by identity, unless force is true)
-            if (!forceReindex && this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity)) {
+            // Check if already indexed (compare by identity, unless force is true).
+            // For git repos we intentionally proceed: syncIndexByGit will re-use the
+            // shared index and apply only the delta (or no-op when HEAD is unchanged).
+            if (!forceReindex && !gitIncrementalEnabled && this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity)) {
                 return {
                     content: [{
                         type: "text",
@@ -813,9 +830,12 @@ export class ToolHandlers {
             const embeddingProvider = this.context.getEmbedding();
             console.log(`[BACKGROUND-INDEX] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} with dimension: ${embeddingProvider.getDimension()}`);
 
-            // Start indexing with the appropriate context and progress tracking
+            // Start indexing with the appropriate context and progress tracking.
+            // syncIndexByGit picks full vs. git-incremental automatically: a force
+            // reindex already cleared the collection + commit state above, so it
+            // does a full run; an unchanged/advanced HEAD does an incremental delta.
             console.log(`[BACKGROUND-INDEX] 🚀 Beginning codebase indexing process...`);
-            const stats = await this.context.indexCodebase(absolutePath, async (progress) => {
+            const stats = await this.context.syncIndexByGit(absolutePath, async (progress) => {
                 // Update progress in snapshot manager using new method
                 this.snapshotManager.setCodebaseIndexing(absolutePath, progress.percentage);
 
@@ -828,8 +848,8 @@ export class ToolHandlers {
                 }
 
                 console.log(`[BACKGROUND-INDEX] Progress: ${progress.phase} - ${progress.percentage}% (${progress.current}/${progress.total})`);
-            }, forceReindex, customIgnorePatterns, customFileExtensions, requestSplitter, signal);
-            console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
+            }, customIgnorePatterns, customFileExtensions, requestSplitter, signal);
+            console.log(`[BACKGROUND-INDEX] ✅ Indexing completed (${stats.mode})! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}, Δ +${stats.added}/~${stats.modified}/-${stats.removed}`);
 
             // Set codebase to indexed status with complete statistics
             this.snapshotManager.setCodebaseIndexed(absolutePath, stats, indexOptions);
@@ -837,7 +857,14 @@ export class ToolHandlers {
             // Save snapshot after updating codebase lists
             await this.snapshotManager.saveCodebaseSnapshot();
 
-            let message = `Background indexing completed for '${absolutePath}' using ${splitterType.toUpperCase()} splitter.\nIndexed ${stats.indexedFiles} files, ${stats.totalChunks} chunks.`;
+            let message = `Background indexing completed for '${absolutePath}' using ${splitterType.toUpperCase()} splitter (${stats.mode} mode).`;
+            if (stats.mode === 'incremental') {
+                message += `\nGit incremental: ${stats.added} added, ${stats.modified} modified, ${stats.removed} removed. Indexed ${stats.indexedFiles} files, ${stats.totalChunks} chunks.`;
+            } else if (stats.mode === 'up-to-date') {
+                message += `\nAlready up to date — no changes since last indexed commit.`;
+            } else {
+                message += `\nIndexed ${stats.indexedFiles} files, ${stats.totalChunks} chunks.`;
+            }
             if (stats.status === 'limit_reached') {
                 message += `\n⚠️  Warning: Indexing stopped because the chunk limit (450,000) was reached. The index may be incomplete.`;
             }

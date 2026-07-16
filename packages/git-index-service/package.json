@@ -1,0 +1,33 @@
+{
+    "name": "@seeway/claude-context-git-index-service",
+    "version": "0.1.14",
+    "description": "Cloud Git Index Service: scheduled incremental indexing of main repositories from GitLab",
+    "type": "module",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "bin": "dist/index.js",
+    "scripts": {
+        "build": "pnpm clean && tsc --build --force",
+        "dev": "tsx --watch src/index.ts",
+        "clean": "rimraf dist",
+        "lint": "eslint src --ext .ts",
+        "lint:fix": "eslint src --ext .ts --fix",
+        "typecheck": "tsc --noEmit",
+        "start": "tsx src/index.ts",
+        "index:once": "GIT_INDEX_RUN_ONCE=true tsx src/index.ts"
+    },
+    "dependencies": {
+        "@seeway/claude-context-core": "workspace:*"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "tsx": "^4.19.4",
+        "typescript": "^5.0.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/ztcools/-AI-.git",
+        "directory": "packages/git-index-service"
+    },
+    "license": "MIT"
+}

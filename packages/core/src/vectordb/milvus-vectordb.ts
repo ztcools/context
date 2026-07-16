@@ -428,6 +428,57 @@ export class MilvusVectorDatabase implements VectorDatabase {
         });
     }
 
+    async sparseSearch(collectionName: string, queryText: string, options?: SearchOptions): Promise<VectorSearchResult[]> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        if (!this.client) {
+            throw new Error('MilvusClient is not initialized after ensureInitialized().');
+        }
+
+        const searchParams: any = {
+            collection_name: collectionName,
+            data: [queryText],
+            anns_field: 'sparse_vector',
+            param: { drop_ratio_search: 0.2 },
+            limit: options?.topK || 10,
+            output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
+        };
+
+        if (options?.filterExpr && options.filterExpr.trim().length > 0) {
+            searchParams.expr = options.filterExpr;
+        }
+
+        const searchResult = await this.client.search(searchParams);
+
+        if (!searchResult.results || searchResult.results.length === 0) {
+            return [];
+        }
+
+        return searchResult.results.map((result: any) => {
+            let metadata = {};
+            try {
+                metadata = JSON.parse(result.metadata || '{}');
+            } catch (error) {
+                console.warn(`[MilvusDB] Failed to parse metadata for item ${result.id}:`, error);
+            }
+
+            return {
+                document: {
+                    id: result.id,
+                    vector: [],
+                    content: result.content,
+                    relativePath: result.relativePath,
+                    startLine: result.startLine,
+                    endLine: result.endLine,
+                    fileExtension: result.fileExtension,
+                    metadata,
+                },
+                score: result.score,
+            };
+        });
+    }
+
     async delete(collectionName: string, ids: string[]): Promise<void> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);

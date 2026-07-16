@@ -1,0 +1,10 @@
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+.github
+*.log
+build-benchmark.json
+package-lock.json
+test
+docs
