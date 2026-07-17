@@ -23,9 +23,9 @@ fi
 INSTALL_DIR="$REAL_HOME/.claude-context"
 REPO_URL="https://github.com/ztcools/context.git"
 
-# 向量后端地址(默认本机;连接远程 Milvus/Ollama 时先 export 覆盖再运行本脚本)
-OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11435}"
-MILVUS_ADDRESS="${MILVUS_ADDRESS:-http://127.0.0.1:19530}"
+# 向量后端地址(默认指向公司服务器,开箱即用;如需改用其它后端,先 export 覆盖再运行)
+OLLAMA_HOST="${OLLAMA_HOST:-http://10.50.4.149:11435}"
+MILVUS_ADDRESS="${MILVUS_ADDRESS:-http://10.50.4.149:19530}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
 EMBEDDING_DIMENSION="${EMBEDDING_DIMENSION:-768}"
 
