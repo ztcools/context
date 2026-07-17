@@ -21,7 +21,7 @@ else
 fi
 
 INSTALL_DIR="$REAL_HOME/.claude-context"
-REPO_URL="https://github.com/ztcools/-AI-.git"
+REPO_URL="https://github.com/ztcools/context.git"
 
 # 向量后端地址(默认本机;连接远程 Milvus/Ollama 时先 export 覆盖再运行本脚本)
 OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11435}"
@@ -78,18 +78,21 @@ echo -e "${GREEN}  ✓ 仓库就绪 ($INSTALL_DIR)${NC}"
 
 echo -e "${YELLOW}[4/7] 安装依赖 (可能需要几分钟)...${NC}"
 cd "$INSTALL_DIR"
+# 只安装 MCP 子图(core + graph + mcp)的依赖,避开 vscode/chrome 的
+# keytar(需 libsecret)、faiss 等原生依赖在用户机上编译失败。
+INSTALL_FILTER='--filter @seeway/claude-context-mcp...'
 if [ -n "$SUDO_USER" ]; then
-    sudo -u "$SUDO_USER" pnpm install --force
+    sudo -u "$SUDO_USER" pnpm install $INSTALL_FILTER --force
 else
-    pnpm install --force
+    pnpm install $INSTALL_FILTER --force
 fi
 echo -e "${GREEN}  ✓ 依赖安装完成${NC}"
 
 echo -e "${YELLOW}[5/7] 构建项目...${NC}"
 if [ -n "$SUDO_USER" ]; then
-    sudo -u "$SUDO_USER" pnpm build
+    sudo -u "$SUDO_USER" bash -c "pnpm build:core && pnpm build:graph && pnpm build:mcp"
 else
-    pnpm build
+    pnpm build:core && pnpm build:graph && pnpm build:mcp
 fi
 echo -e "${GREEN}  ✓ 构建完成${NC}"
 
