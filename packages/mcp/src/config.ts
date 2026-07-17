@@ -253,7 +253,7 @@ Environment Variables:
   MILVUS_TOKEN            Milvus token (optional, used for authentication and address resolution)
   CODE_CHUNKS_COLLECTION_NAME_OVERRIDE
                           Optional readable prefix for collection names.
-                          Uses code_chunks_<override>_<pathHash> (or hybrid_...)
+                          Uses cc_<override>_<pathHash> (or hcc_ in hybrid mode)
                           after sanitization (letters/digits/underscore, 255 chars max).
                           The per-codebase pathHash is preserved so multiple
                           codebases stay distinct under the same override.

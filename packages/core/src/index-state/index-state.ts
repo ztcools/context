@@ -33,6 +33,9 @@ export interface CommitState {
     // Files this branch changed relative to the root (main), used to mask the root
     // layer at query time.
     overridePaths?: string[];
+    // The Milvus collection holding this branch's chunks. Stored so the index-tree UI
+    // can map a branch to its collection (row counts) without recomputing the hash.
+    collectionName?: string;
 }
 
 export interface SetStateOptions {
@@ -40,6 +43,7 @@ export interface SetStateOptions {
     baseIdentity?: string | null;
     parentIdentity?: string | null;
     overridePaths?: string[];
+    collectionName?: string;
 }
 
 export class CommitIndexState {
@@ -129,6 +133,32 @@ export class CommitIndexState {
         }
     }
 
+    /** Every recorded branch state across all repositories (for the index-tree UI). */
+    async getAll(): Promise<CommitState[]> {
+        try {
+            await this.ensureCollection();
+            const rows = await this.db.query(
+                CommitIndexState.COLLECTION,
+                'id != ""',
+                ['id', 'content'],
+                16384,
+            );
+            const states: CommitState[] = [];
+            for (const row of rows) {
+                const raw = row.content as string | undefined;
+                if (!raw) continue;
+                try {
+                    const parsed = JSON.parse(raw) as CommitState;
+                    if (parsed.headCommit) states.push(parsed);
+                } catch { /* skip malformed row */ }
+            }
+            return states;
+        } catch (error) {
+            console.warn(`[IndexState] ⚠️  Failed to list all states: ${this.fmt(error)}`);
+            return [];
+        }
+    }
+
     /** Record (upsert) that `identity` is now indexed up to `headCommit`. */
     async set(identity: string, headCommit: string, dimension: number, options: SetStateOptions = {}): Promise<void> {
         try {
@@ -143,6 +173,7 @@ export class CommitIndexState {
                 baseIdentity: options.baseIdentity ?? null,
                 parentIdentity: options.parentIdentity ?? null,
                 overridePaths: options.overridePaths ?? [],
+                collectionName: options.collectionName,
             };
             const id = this.idFor(identity);
             const doc: VectorDocument = {

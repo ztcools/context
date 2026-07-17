@@ -416,7 +416,7 @@ export class Context {
      */
     public getCollectionNameForIdentity(identity: string): string {
         const isHybrid = this.getIsHybrid();
-        const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
+        const prefix = isHybrid === true ? 'hcc' : 'cc';
         const pathHash = crypto.createHash('md5').update(identity).digest('hex').substring(0, 8);
 
         // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
@@ -433,7 +433,29 @@ export class Context {
             return `${prefix}_${suffix}`;
         }
 
-        return `${prefix}_${pathHash}`;
+        // Human-readable, attu-friendly: <prefix>_<repo>_<hash>. The repo slug surfaces the
+        // source right in the name (the old long "hybrid_code_chunks_" prefix buried it behind
+        // attu's column truncation); the branch is intentionally NOT in the name — a repo's
+        // main and all its branches read as the same repo, and the branch hierarchy is shown
+        // in the dedicated index-tree UI + the collection description. The hash keeps names
+        // unique and deterministic per identity (index-time and search-time agree).
+        const slug = this.slugForIdentity(identity);
+        return `${prefix}_${slug}_${pathHash}`;
+    }
+
+    /** Derive a readable repo slug from a repo identity (`<url>:<branch>` or a path). */
+    private slugForIdentity(identity: string): string {
+        const isGitUrl = /:\/\//.test(identity) || /^git@/.test(identity);
+        let repoPart = identity;
+        if (isGitUrl) {
+            // Git refs cannot contain ':', so the branch is always after the last colon.
+            const i = identity.lastIndexOf(':');
+            if (i > 0) repoPart = identity.slice(0, i);
+        }
+        repoPart = repoPart.replace(/\.git$/i, '');
+        const seg = repoPart.split(/[/:]/).filter(Boolean).pop() || 'repo';
+        const repo = seg.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 32);
+        return repo || 'repo';
     }
 
     private getValidOverrideValue(value?: string): string | undefined {
@@ -554,6 +576,7 @@ export class Context {
                 repoUrl: getRemoteUrl(codebasePath) || undefined,
                 baseIdentity: null,
                 overridePaths: [],
+                collectionName: this.getCollectionName(codebasePath),
             });
         }
 
@@ -608,14 +631,22 @@ export class Context {
         const empty = { root: null, parentIdentity: null, diff: null, overridePaths: [] as string[] };
         if (!this.readBoolEnv('GIT_LAYERED_ENABLED', true)) return empty;
 
+        // main/master (configurable) is ALWAYS the repo root — it is never a delta
+        // of another branch, so a feature branch indexed before main can't displace
+        // it. Indexing a root branch => full index, base=null.
+        const rootBranches = String(envManager.get('GIT_ROOT_BRANCHES') ?? 'main,master')
+            .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+        if (rootBranches.includes(this.branchOf(identity, repoUrl).toLowerCase())) return empty;
+
         const others = (await this.commitIndexState.getByRepo(repoUrl)).filter(c => c.identity !== identity && !!c.headCommit);
         if (others.length === 0) return empty;
 
-        // Search root = an indexed ROOT branch (baseIdentity==null), preferring
-        // main/master by name. This is the shared base every branch composes with.
-        const rootPool = others.filter(c => !c.baseIdentity);
-        const pool = rootPool.length > 0 ? rootPool : others;
-        let root = pool.find(c => ['main', 'master'].includes(this.branchOf(c.identity, repoUrl))) || pool[0];
+        // Search root = the indexed main/master branch BY NAME (the canonical root),
+        // regardless of how it was recorded; else an indexed base=null root; else any.
+        // This is the shared base every branch composes with.
+        let root = others.find(c => rootBranches.includes(this.branchOf(c.identity, repoUrl).toLowerCase()))
+            || others.find(c => !c.baseIdentity)
+            || others[0];
 
         // Resolve the diff base commit against the developer's LOCAL view of the
         // root branch (origin/<main> or <main>), so a branch still diffs correctly
@@ -786,6 +817,7 @@ export class Context {
             baseIdentity: root.identity,
             parentIdentity: lineage.parentIdentity,
             overridePaths,
+            collectionName: this.getCollectionName(codebasePath),
         });
         progressCallback?.({ phase: 'Branch delta indexing complete!', current: 100, total: 100, percentage: 100 });
 
@@ -927,7 +959,7 @@ export class Context {
             progressCallback?.({ phase: 'Already up to date', current: 100, total: 100, percentage: 100 });
             const dim = await this.resolveDimension();
             const meta = await this.computeLayerMeta(codebasePath, identity, head, repoUrl);
-            await this.commitIndexState.set(identity, head, dim, { repoUrl: repoUrl || undefined, ...meta });
+            await this.commitIndexState.set(identity, head, dim, { repoUrl: repoUrl || undefined, ...meta, collectionName: this.getCollectionName(codebasePath) });
             return { mode: 'up-to-date', indexedFiles: 0, totalChunks: 0, added: 0, modified: 0, removed: 0, baseIdentity: meta.baseIdentity, status: 'completed' };
         }
 
@@ -965,7 +997,7 @@ export class Context {
         // refresh the base pointer + override paths for the layered query.
         const dim = await this.resolveDimension();
         const meta = await this.computeLayerMeta(codebasePath, identity, head, repoUrl);
-        await this.commitIndexState.set(identity, head, dim, { repoUrl: repoUrl || undefined, ...meta });
+        await this.commitIndexState.set(identity, head, dim, { repoUrl: repoUrl || undefined, ...meta, collectionName: this.getCollectionName(codebasePath) });
         progressCallback?.({ phase: 'Incremental indexing complete!', current: 100, total: 100, percentage: 100 });
 
         return {
@@ -1460,10 +1492,15 @@ export class Context {
             console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
         }
         const repoIdentity = this.getRepoIdentityCached(codebasePath);
-        // Encode the immediate parent branch in the description so Attu can
-        // reconstruct the branch-tracking tree (A ← B ← C). Keeps the
-        // `codebasePath:` prefix that cloud-sync parses; parent appended after `|`.
-        const description = `codebasePath:${repoIdentity}|parent:${parentIdentity || ''}`;
+        // Description = `codebasePath:<identity>` for a root branch, plus `|tracks:<branch>`
+        // for a sub-branch naming the branch it tracks (its immediate parent). Lets the
+        // index-tree UI reconstruct the branch-tracking chain (A ← B ← C). Keeps the
+        // `codebasePath:` prefix that cloud-sync parses (everything before the first `|`).
+        const repoUrl = getRemoteUrl(codebasePath);
+        const trackedBranch = parentIdentity && repoUrl ? this.branchOf(parentIdentity, repoUrl) : '';
+        const description = trackedBranch
+            ? `codebasePath:${repoIdentity}|tracks:${trackedBranch}`
+            : `codebasePath:${repoIdentity}`;
 
         if (isHybrid === true) {
             await this.vectorDatabase.createHybridCollection(collectionName, dimension, description);

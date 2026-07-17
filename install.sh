@@ -23,6 +23,12 @@ fi
 INSTALL_DIR="$REAL_HOME/.claude-context"
 REPO_URL="https://github.com/ztcools/-AI-.git"
 
+# 向量后端地址(默认本机;连接远程 Milvus/Ollama 时先 export 覆盖再运行本脚本)
+OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11435}"
+MILVUS_ADDRESS="${MILVUS_ADDRESS:-http://127.0.0.1:19530}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
+EMBEDDING_DIMENSION="${EMBEDDING_DIMENSION:-768}"
+
 echo -e "${GREEN}============================================${NC}"
 echo -e "${GREEN}  Seeway Claude Context 安装脚本${NC}"
 echo -e "${GREEN}============================================${NC}"
@@ -116,10 +122,10 @@ data['mcpServers']['claude-context'] = {
     'args': ['$MCP_ENTRY'],
     'env': {
         'EMBEDDING_PROVIDER': 'Ollama',
-        'EMBEDDING_MODEL': 'nomic-embed-text',
-        'OLLAMA_HOST': 'http://10.50.4.149:11435',
-        'EMBEDDING_DIMENSION': '768',
-        'MILVUS_ADDRESS': 'http://10.50.4.149:19530',
+        'EMBEDDING_MODEL': '$EMBEDDING_MODEL',
+        'OLLAMA_HOST': '$OLLAMA_HOST',
+        'EMBEDDING_DIMENSION': '$EMBEDDING_DIMENSION',
+        'MILVUS_ADDRESS': '$MILVUS_ADDRESS',
         'EMBEDDING_BATCH_SIZE': '256'
     }
 }
@@ -138,10 +144,10 @@ if command -v claude &> /dev/null; then
     if [ -n "$SUDO_USER" ]; then
         sudo -u "$SUDO_USER" claude mcp add claude-context -s user \
             -e EMBEDDING_PROVIDER=Ollama \
-            -e EMBEDDING_MODEL=nomic-embed-text \
-            -e OLLAMA_HOST=http://10.50.4.149:11435 \
-            -e EMBEDDING_DIMENSION=768 \
-            -e MILVUS_ADDRESS=http://10.50.4.149:19530 \
+            -e EMBEDDING_MODEL="$EMBEDDING_MODEL" \
+            -e OLLAMA_HOST="$OLLAMA_HOST" \
+            -e EMBEDDING_DIMENSION="$EMBEDDING_DIMENSION" \
+            -e MILVUS_ADDRESS="$MILVUS_ADDRESS" \
             -e EMBEDDING_BATCH_SIZE=256 \
 -- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
                 echo "  CLI 配置失败，尝试直接写入配置文件..."
@@ -150,10 +156,10 @@ if command -v claude &> /dev/null; then
     else
         claude mcp add claude-context -s user \
             -e EMBEDDING_PROVIDER=Ollama \
-            -e EMBEDDING_MODEL=nomic-embed-text \
-            -e OLLAMA_HOST=http://10.50.4.149:11435 \
-            -e EMBEDDING_DIMENSION=768 \
-            -e MILVUS_ADDRESS=http://10.50.4.149:19530 \
+            -e EMBEDDING_MODEL="$EMBEDDING_MODEL" \
+            -e OLLAMA_HOST="$OLLAMA_HOST" \
+            -e EMBEDDING_DIMENSION="$EMBEDDING_DIMENSION" \
+            -e MILVUS_ADDRESS="$MILVUS_ADDRESS" \
             -e EMBEDDING_BATCH_SIZE=256 \
 -- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
                 echo "  CLI 配置失败，尝试直接写入配置文件..."

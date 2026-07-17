@@ -1,4 +1,5 @@
 import { RepoSpec, ServiceConfig } from './config.js';
+import { ConfigStore } from './config-store.js';
 
 /**
  * Source of the main repositories to keep indexed. Implementations decide where
@@ -14,6 +15,14 @@ export class ConfigRepoProvider implements RepoProvider {
     constructor(private repos: RepoSpec[]) {}
     async listRepos(): Promise<RepoSpec[]> {
         return this.repos;
+    }
+}
+
+/** Repos read live from the hot ConfigStore, so UI edits take effect next pass. */
+export class StoreRepoProvider implements RepoProvider {
+    constructor(private store: ConfigStore) {}
+    async listRepos(): Promise<RepoSpec[]> {
+        return this.store.getRepos();
     }
 }
 

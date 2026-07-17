@@ -34,7 +34,10 @@ export class RepoManager {
     }
 
     private git(dir: string, args: string): string {
-        return execSync(`git ${args}`, {
+        // Internal GitLab with a self-signed cert → set GIT_SSL_NO_VERIFY=true to skip TLS verify.
+        const noVerify = String(process.env.GIT_SSL_NO_VERIFY || '').toLowerCase();
+        const sslOpt = (noVerify === 'true' || noVerify === '1') ? '-c http.sslVerify=false ' : '';
+        return execSync(`git ${sslOpt}${args}`, {
             cwd: dir,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],

@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity, isGitRepo, envManager } from "@seeway/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity, isGitRepo, getCurrentBranch, envManager } from "@seeway/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, CodebaseInfoIndexFailed, CodebaseInfoIndexing, CodebaseInfoIndexed, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
@@ -311,7 +311,8 @@ export class ToolHandlers {
 
             // Filter to code collections first
             const codeCollections = collections.filter(
-                (c) => c.startsWith('code_chunks_') || c.startsWith('hybrid_code_chunks_')
+                (c) => c.startsWith('cc_') || c.startsWith('hcc_')
+                    || c.startsWith('code_chunks_') || c.startsWith('hybrid_code_chunks_')
             );
 
             if (codeCollections.length === 0) {
@@ -572,6 +573,29 @@ export class ToolHandlers {
                     }],
                     isError: true
                 };
+            }
+
+            // === main/master are server-managed ===
+            // The root branch is kept indexed by the server-side git-index-service
+            // (scheduled GitLab pull). The local MCP must NOT index it — developers
+            // index their feature branches, which layer on top of that server-built
+            // root. The git-index-service calls context.syncIndexByGit directly and
+            // never goes through this handler, so it is unaffected.
+            if (gitIncrementalEnabled) {
+                const rootBranches = String(envManager.get('GIT_ROOT_BRANCHES') ?? 'main,master')
+                    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+                const allowLocalRoot =
+                    String(envManager.get('GIT_ALLOW_LOCAL_ROOT_INDEX') ?? 'false').toLowerCase() === 'true';
+                const currentBranch = (getCurrentBranch(absolutePath) || '').toLowerCase();
+                if (!allowLocalRoot && currentBranch && rootBranches.includes(currentBranch)) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `分支 '${currentBranch}' 由服务器索引服务托管，本地不索引 ${rootBranches.join('/')}。\n请切到你的特性分支后再索引；${rootBranches[0]} 会由服务器定时从 GitLab 更新，你的分支会自动叠加它作为基座。\n（如确需本地建根：设置环境变量 GIT_ALLOW_LOCAL_ROOT_INDEX=true）`
+                        }],
+                        isError: true
+                    };
+                }
             }
 
             // === CRITICAL: Pre-check identity in vector database ===
