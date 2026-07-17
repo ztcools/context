@@ -145,6 +145,8 @@ print('OK')
 if command -v claude &> /dev/null; then
     echo "  检测到 Claude Code，通过 claude CLI 配置..."
     if [ -n "$SUDO_USER" ]; then
+        # 幂等:先移除已存在的同名配置,避免 "already exists" 报错
+        sudo -u "$SUDO_USER" claude mcp remove claude-context -s user 2>/dev/null || true
         sudo -u "$SUDO_USER" claude mcp add claude-context -s user \
             -e EMBEDDING_PROVIDER=Ollama \
             -e EMBEDDING_MODEL="$EMBEDDING_MODEL" \
@@ -157,6 +159,8 @@ if command -v claude &> /dev/null; then
                 add_mcp_to_json "$CLAUDE_JSON" && echo -e "${GREEN}  ✓ MCP 已写入 $CLAUDE_JSON${NC}"
             }
     else
+        # 幂等:先移除已存在的同名配置,避免 "already exists" 报错
+        claude mcp remove claude-context -s user 2>/dev/null || true
         claude mcp add claude-context -s user \
             -e EMBEDDING_PROVIDER=Ollama \
             -e EMBEDDING_MODEL="$EMBEDDING_MODEL" \
