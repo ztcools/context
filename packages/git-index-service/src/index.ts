@@ -5,6 +5,7 @@ import { GitIndexer } from './indexer.js';
 import { Scheduler } from './scheduler.js';
 import { startHttpServer } from './server.js';
 import { ConfigStore } from './config-store.js';
+import { SshKeyManager } from './ssh-key.js';
 
 async function main(): Promise<void> {
     const config = loadServiceConfig();
@@ -20,7 +21,9 @@ async function main(): Promise<void> {
     });
 
     const context = buildContext();
-    const repoManager = new RepoManager(config.workdir);
+    const sshKeys = new SshKeyManager(config.sshDir);
+    sshKeys.ensureKeyPair();
+    const repoManager = new RepoManager(config.workdir, sshKeys);
 
     // Hot config store: repos + schedule persisted to a JSON file, seeded from env
     // on first run. Management API edits are written back and take effect live.
@@ -34,7 +37,7 @@ async function main(): Promise<void> {
     const repoProvider = config.source === 'gitlab'
         ? createRepoProvider(config)
         : new StoreRepoProvider(store);
-    const indexer = new GitIndexer(context, repoManager, repoProvider);
+    const indexer = new GitIndexer(context, repoManager, repoProvider, store);
 
     if (config.runOnce) {
         const results = await indexer.indexAll();
@@ -49,7 +52,7 @@ async function main(): Promise<void> {
     });
 
     if (config.httpPort) {
-        startHttpServer(config.httpPort, indexer, store, scheduler);
+        startHttpServer(config.httpPort, indexer, store, scheduler, sshKeys);
     }
 
     if (config.runOnStart) {

@@ -22,6 +22,7 @@ export interface ServiceConfig {
     repos: RepoSpec[];
     source: 'config' | 'gitlab';
     workdir: string;
+    sshDir: string;
     configFile: string;
     runOnStart: boolean;
     runOnce: boolean;
@@ -77,6 +78,8 @@ export function loadServiceConfig(): ServiceConfig {
         || path.join(os.homedir(), '.claude-context', 'git-index-repos');
     const configFile = envManager.get('GIT_INDEX_CONFIG_FILE')
         || path.join(path.dirname(workdir), 'git-index-config.json');
+    const sshDir = envManager.get('GIT_INDEX_SSH_DIR')
+        || path.join(path.dirname(workdir), 'ssh');
     const httpPortRaw = envManager.get('GIT_INDEX_HTTP_PORT');
     const dailyHourRaw = envManager.get('GIT_INDEX_DAILY_HOUR');
     const projectIdsRaw = envManager.get('GITLAB_PROJECT_IDS') || '';
@@ -85,6 +88,7 @@ export function loadServiceConfig(): ServiceConfig {
         repos: parseReposEnv(),
         source,
         workdir,
+        sshDir,
         configFile,
         runOnStart: bool('GIT_INDEX_RUN_ON_START', true),
         runOnce: bool('GIT_INDEX_RUN_ONCE', false),

@@ -26,7 +26,7 @@ RUN pnpm --filter @seeway/claude-context-core build \
 FROM node:20-bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive NODE_ENV=production
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # Copy the whole workspace (preserves pnpm symlink layout so core resolves + native .node files).

@@ -840,7 +840,7 @@ export class ToolHandlers {
             if (customFileExtensions.length > 0) {
                 console.log(`[BACKGROUND-INDEX] Using ${customFileExtensions.length} request-scoped custom extensions: ${customFileExtensions.join(', ')}`);
             }
-            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, supportedExtensions);
+            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, supportedExtensions, this.context.getSupportedFilenames());
             await synchronizer.initialize();
 
             // Store synchronizer in the context (let context manage collection names)

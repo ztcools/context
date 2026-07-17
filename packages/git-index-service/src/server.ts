@@ -3,6 +3,7 @@ import { GitIndexer } from './indexer.js';
 import { ConfigStore } from './config-store.js';
 import { Scheduler } from './scheduler.js';
 import { RepoSpec } from './config.js';
+import { SshKeyManager } from './ssh-key.js';
 
 /**
  * Management HTTP API for the git index service. Framework-free. Enables CORS so
@@ -10,6 +11,7 @@ import { RepoSpec } from './config.js';
  *   GET  /health
  *   GET  /status                 overall status (schedule, repos, last runs)
  *   GET  /repos                  list repos (tokens masked)
+ *   GET  /ssh-key                the service SSH deploy public key
  *   POST /repos                  add/replace a repo {name,url,branch,token?}
  *   PUT  /repos/:name            update a repo
  *   DELETE /repos/:name          remove a repo
@@ -22,12 +24,15 @@ export function startHttpServer(
     indexer: GitIndexer,
     store: ConfigStore,
     scheduler: Scheduler,
+    sshKeys: SshKeyManager,
 ): http.Server {
     const maskRepo = (r: RepoSpec) => ({
         name: r.name,
         url: r.url,
         branch: r.branch,
         hasToken: !!r.token,
+        // token → https clone/pull; no token → ssh with the service deploy key
+        auth: r.token ? 'https' : 'ssh',
     });
 
     const send = (res: http.ServerResponse, code: number, body: unknown) => {
@@ -55,6 +60,7 @@ export function startHttpServer(
         const sched = scheduler.getSchedule();
         return {
             running: indexer.isRunning(),
+            current: indexer.getCurrent(),
             lastPassAt: indexer.getLastPassAt(),
             schedule: {
                 dailyHour: sched.dailyHour,
@@ -83,6 +89,9 @@ export function startHttpServer(
             }
             if (method === 'GET' && url === '/repos') {
                 return send(res, 200, { repos: store.getRepos().map(maskRepo) });
+            }
+            if (method === 'GET' && url === '/ssh-key') {
+                return send(res, 200, { publicKey: sshKeys.getPublicKey() });
             }
             if (method === 'POST' && url === '/repos') {
                 const body = await readBody(req);

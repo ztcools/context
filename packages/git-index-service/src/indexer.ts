@@ -1,6 +1,7 @@
 import { Context } from '@seeway/claude-context-core';
 import { RepoManager } from './repo-manager.js';
 import { RepoProvider } from './repo-provider.js';
+import { ConfigStore } from './config-store.js';
 import { RepoSpec } from './config.js';
 
 export interface RepoIndexResult {
@@ -19,6 +20,12 @@ export interface RepoRunStatus extends RepoIndexResult {
     durationMs: number;
 }
 
+export interface CurrentProgress {
+    repo: string;
+    phase: string;
+    percentage: number;
+}
+
 /**
  * Orchestrates one indexing pass over all main repositories: fetch each to its
  * branch tip (RepoManager), then let the core Context apply only the git delta
@@ -30,11 +37,13 @@ export class GitIndexer {
     private running = false;
     private lastRun: Map<string, RepoRunStatus> = new Map();
     private lastPassAt: number | null = null;
+    private current: CurrentProgress | null = null;
 
     constructor(
         private context: Context,
         private repoManager: RepoManager,
         private repoProvider: RepoProvider,
+        private store?: ConfigStore,
     ) {}
 
     isRunning(): boolean {
@@ -49,12 +58,29 @@ export class GitIndexer {
         return this.lastRun.get(name);
     }
 
+    getCurrent(): CurrentProgress | null {
+        return this.current;
+    }
+
     async indexOne(repo: RepoSpec): Promise<RepoIndexResult> {
         const startedAt = this.now();
+        this.current = { repo: repo.name, phase: '准备中', percentage: 0 };
         try {
-            const localPath = this.repoManager.ensureCheckout(repo);
-            const stats = await this.context.syncIndexByGit(localPath);
-            console.log(`[GitIndexer] ✅ ${repo.name} [${repo.branch}] → ${stats.mode} (+${stats.added}/~${stats.modified}/-${stats.removed}, files=${stats.indexedFiles})`);
+            this.current = { repo: repo.name, phase: '拉取仓库', percentage: 0 };
+            const { dir: localPath, branch } = this.repoManager.ensureCheckout(repo);
+            // Persist the branch actually indexed when it differs (default-branch fallback).
+            if (branch !== repo.branch) {
+                this.store?.setRepoBranch(repo.name, branch);
+                repo = { ...repo, branch };
+            }
+            const stats = await this.context.syncIndexByGit(localPath, p => {
+                this.current = {
+                    repo: repo.name,
+                    phase: p.phase,
+                    percentage: Math.round(p.percentage),
+                };
+            });
+            console.log(`[GitIndexer] ✅ ${repo.name} [${branch}] → ${stats.mode} (+${stats.added}/~${stats.modified}/-${stats.removed}, files=${stats.indexedFiles})`);
             const result: RepoIndexResult = {
                 repo: repo.name,
                 ok: true,
@@ -72,6 +98,8 @@ export class GitIndexer {
             const result: RepoIndexResult = { repo: repo.name, ok: false, error: msg };
             this.record(repo.name, result, startedAt);
             return result;
+        } finally {
+            this.current = null;
         }
     }
 

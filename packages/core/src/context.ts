@@ -72,14 +72,39 @@ export class EmbeddingError extends Error {
 }
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
-    // Programming languages
-    '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
-    '.cs', '.go', '.rs', '.php', '.rb', '.swift', '.kt', '.scala', '.m', '.mm',
-    '.dart', '.sol',
+    // C / C++ / CUDA (core stack for perception / planning / control)
+    '.c', '.h', '.cpp', '.cc', '.cxx', '.hpp', '.hh', '.hxx', '.inl', '.ipp',
+    '.tpp', '.cu', '.cuh',
+    // Python (incl. Cython)
+    '.py', '.pyi', '.pyx', '.pxd',
+    // Other programming languages
+    '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.java', '.cs', '.go', '.rs',
+    '.php', '.rb', '.swift', '.kt', '.kts', '.scala', '.m', '.mm', '.dart', '.sol',
+    '.lua', '.pl', '.pm', '.r', '.jl', '.ex', '.exs', '.erl', '.hs', '.clj',
+    '.cljs', '.groovy', '.vue', '.svelte', '.astro', '.zig', '.nim', '.gd', '.vb',
+    // Shell & scripting
+    '.sh', '.bash', '.zsh', '.fish', '.ps1', '.psm1', '.bat', '.cmd',
+    // CI / build / infra
+    '.jenkinsfile', '.gradle', '.tf', '.tfvars', '.hcl', '.cmake', '.mk', '.bazel',
+    '.bzl', '.dockerfile',
+    // ROS / robotics description
+    '.msg', '.srv', '.action', '.launch', '.urdf', '.xacro', '.sdf',
+    // Config & data
+    '.json', '.jsonc', '.json5', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.properties', '.xml', '.proto', '.graphql', '.gql',
+    // Web & styles
+    '.html', '.htm', '.css', '.scss', '.less', '.sass',
+    // Database
+    '.sql',
     // Text and markup files
-    '.md', '.markdown', '.ipynb',
-    // '.txt',  '.json', '.yaml', '.yml', '.xml', '.html', '.htm',
-    // '.css', '.scss', '.less', '.sql', '.sh', '.bash', '.env'
+    '.md', '.markdown', '.rst', '.adoc', '.txt', '.ipynb',
+];
+
+// Well-known extensionless files that should be indexed as code/config.
+const DEFAULT_SUPPORTED_FILENAMES = [
+    'Dockerfile', 'Containerfile', 'Jenkinsfile', 'Makefile', 'GNUmakefile',
+    'Rakefile', 'Gemfile', 'Vagrantfile', 'Procfile', 'Brewfile', 'Justfile',
+    'Taskfile', 'CMakeLists.txt', 'Berksfile',
 ];
 
 const DEFAULT_IGNORE_PATTERNS = [
@@ -107,6 +132,8 @@ const DEFAULT_IGNORE_PATTERNS = [
     '.cache/**',
     '__pycache__/**',
     '.pytest_cache/**',
+    '.mypy_cache/**',
+    '.ruff_cache/**',
     '.next/**',
     '.nuxt/**',
     '.turbo/**',
@@ -116,6 +143,48 @@ const DEFAULT_IGNORE_PATTERNS = [
     // Dependency directories
     'vendor/**',
     'bower_components/**',
+
+    // C/C++ & CMake build trees
+    'cmake-build-*/**',
+    'CMakeFiles/**',
+    '_build/**',
+    '**/*.o', '**/*.obj', '**/*.a', '**/*.lib', '**/*.so', '**/*.so.*',
+    '**/*.dylib', '**/*.dll', '**/*.exe', '**/*.out', '**/*.d',
+    // Bazel
+    'bazel-*/**',
+    // ROS / catkin / colcon workspaces (generated)
+    'devel/**',
+    'install/**',
+    'devel_isolated/**',
+    'build_isolated/**',
+    '.catkin_tools/**',
+    'log/**',
+    // Generated sources (protobuf / gRPC / Qt moc)
+    '**/*.pb.cc', '**/*.pb.h', '**/*_pb2.py', '**/*_pb2_grpc.py',
+    '**/moc_*.cpp', '**/ui_*.h', '**/qrc_*.cpp',
+    // Python envs & packaging
+    '*.egg-info/**',
+    '.tox/**',
+    'venv/**',
+    '.venv/**',
+    '**/*.pyc', '**/*.pyo', '**/*.pyd',
+
+    // Models / weights / serialized graphs (large binaries)
+    '**/*.onnx', '**/*.pt', '**/*.pth', '**/*.pb', '**/*.h5', '**/*.hdf5',
+    '**/*.ckpt', '**/*.caffemodel', '**/*.weights', '**/*.engine', '**/*.plan',
+    '**/*.trt', '**/*.tlt', '**/*.safetensors', '**/*.mlmodel',
+    // Datasets / recordings / point clouds / media (huge in AD repos)
+    '**/*.bag', '**/*.mcap', '**/*.pcd', '**/*.ply', '**/*.las', '**/*.laz',
+    '**/*.npy', '**/*.npz', '**/*.mat', '**/*.parquet', '**/*.tfrecord',
+    '**/*.jpg', '**/*.jpeg', '**/*.png', '**/*.bmp', '**/*.tiff', '**/*.gif',
+    '**/*.ico', '**/*.mp4', '**/*.avi', '**/*.mov', '**/*.mkv',
+    '**/*.bin', '**/*.dat', '**/*.raw',
+    // Archives & docs (binary)
+    '**/*.zip', '**/*.tar', '**/*.tar.gz', '**/*.tgz', '**/*.gz', '**/*.bz2',
+    '**/*.xz', '**/*.7z', '**/*.rar',
+    '**/*.pdf', '**/*.docx', '**/*.xlsx', '**/*.pptx',
+    // Fonts
+    '**/*.woff', '**/*.woff2', '**/*.ttf', '**/*.eot', '**/*.otf',
 
     // Logs and temporary files
     'logs/**',
@@ -139,6 +208,18 @@ const DEFAULT_IGNORE_PATTERNS = [
     '*.polyfills.js',
     '*.runtime.js',
     '*.map', // source map files
+
+    // Lock files (large, generated, low semantic value)
+    'package-lock.json',
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'Cargo.lock',
+    'composer.lock',
+    'poetry.lock',
+    'Gemfile.lock',
+    'go.sum',
+    '*.lock',
+
     'node_modules', '.git', '.svn', '.hg', 'build', 'dist', 'out',
     'target', '.vscode', '.idea', '__pycache__', '.pytest_cache',
     'coverage', '.nyc_output', 'logs', 'tmp', 'temp'
@@ -162,6 +243,7 @@ export class Context {
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
+    private supportedFilenames: string[] = DEFAULT_SUPPORTED_FILENAMES;
     private baseIgnorePatterns: string[];
     private ignorePatterns: string[];
     private collectionNameOverride?: string;
@@ -281,6 +363,17 @@ export class Context {
     getEffectiveSupportedExtensions(additionalExtensions: string[] = []): string[] {
         const normalizedExtensions = this.normalizeExtensions(additionalExtensions);
         return [...new Set([...this.supportedExtensions, ...normalizedExtensions])];
+    }
+
+    getSupportedFilenames(): string[] {
+        return [...this.supportedFilenames];
+    }
+
+    /** A file is indexable if its extension OR its basename (e.g. Dockerfile) is supported. */
+    private isSupportedFile(relOrPath: string, supportedExtensions: string[] = this.supportedExtensions): boolean {
+        const ext = path.extname(relOrPath);
+        if (ext && supportedExtensions.includes(ext)) return true;
+        return this.supportedFilenames.includes(path.basename(relOrPath));
     }
 
     /**
@@ -782,7 +875,7 @@ export class Context {
             const m = this.mapRepoPathToIndex(codebasePath, repoRoot, f);
             if (!m) continue;
             if (!fs.existsSync(m.abs)) continue;
-            if (!supportedExtensions.includes(path.extname(m.rel))) continue;
+            if (!this.isSupportedFile(m.rel, supportedExtensions)) continue;
             if (this.matchesIgnorePattern(m.abs, codebasePath, ignorePatterns)) continue;
             indexAbsPaths.push(m.abs);
         }
@@ -948,7 +1041,7 @@ export class Context {
             const m = toIndexPath(f);
             if (!m) continue;
             if (!fs.existsSync(m.abs)) continue;
-            if (!supportedExtensions.includes(path.extname(m.rel))) continue;
+            if (!this.isSupportedFile(m.rel, supportedExtensions)) continue;
             if (this.matchesIgnorePattern(m.abs, codebasePath, ignorePatterns)) continue;
             indexAbsPaths.push(m.abs);
         }
@@ -1030,7 +1123,7 @@ export class Context {
             const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
 
             // To be safe, let's initialize if it's not there.
-            const newSynchronizer = new FileSynchronizer(codebasePath, ignorePatterns, supportedExtensions);
+            const newSynchronizer = new FileSynchronizer(codebasePath, ignorePatterns, supportedExtensions, this.supportedFilenames);
             await newSynchronizer.initialize();
             this.synchronizers.set(collectionName, newSynchronizer);
         }
@@ -1524,7 +1617,8 @@ export class Context {
         // Try git ls-files first — respects .gitignore and is much faster
         try {
             const extPatterns = supportedExtensions.map((e) => `"*${e}"`).join(' ');
-            const output = execSync(`git -C "${codebasePath}" ls-files --cached --others --exclude-standard -- ${extPatterns}`, {
+            const namePatterns = this.supportedFilenames.map((n) => `"*${n}"`).join(' ');
+            const output = execSync(`git -C "${codebasePath}" ls-files --cached --others --exclude-standard -- ${extPatterns} ${namePatterns}`, {
                 encoding: 'utf-8',
                 timeout: 10_000,
                 maxBuffer: 10 * 1024 * 1024,
@@ -1556,8 +1650,7 @@ export class Context {
                 if (entry.isDirectory()) {
                     await traverseDirectory(fullPath);
                 } else if (entry.isFile()) {
-                    const ext = path.extname(entry.name);
-                    if (supportedExtensions.includes(ext)) {
+                    if (this.isSupportedFile(entry.name, supportedExtensions)) {
                         files.push(fullPath);
                     }
                 }

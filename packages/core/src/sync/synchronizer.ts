@@ -15,14 +15,22 @@ export class FileSynchronizer {
     private snapshotPath: string;
     private ignorePatterns: string[];
     private supportedExtensions: string[];
+    private supportedFilenames: string[];
 
-    constructor(rootDir: string, ignorePatterns: string[] = [], supportedExtensions: string[] = []) {
+    constructor(rootDir: string, ignorePatterns: string[] = [], supportedExtensions: string[] = [], supportedFilenames: string[] = []) {
         this.rootDir = rootDir;
         this.snapshotPath = this.getSnapshotPath(rootDir);
         this.fileHashes = new Map();
         this.merkleDAG = new MerkleDAG();
         this.ignorePatterns = ignorePatterns;
         this.supportedExtensions = supportedExtensions;
+        this.supportedFilenames = supportedFilenames;
+    }
+
+    private isSupported(name: string): boolean {
+        const ext = path.extname(name);
+        if (ext && this.supportedExtensions.includes(ext)) return true;
+        return this.supportedFilenames.includes(path.basename(name));
     }
 
     private getSnapshotPath(codebasePath: string): string {
@@ -61,8 +69,9 @@ export class FileSynchronizer {
                 return fileHashes;
             }
             const extPatterns = this.supportedExtensions.map((e) => `"*${e}"`).join(' ');
+            const namePatterns = this.supportedFilenames.map((n) => `"*${n}"`).join(' ');
             const output = execSync(
-                `git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns}`,
+                `git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns} ${namePatterns}`,
                 { encoding: 'utf-8', timeout: 10_000, maxBuffer: 10 * 1024 * 1024 }
             );
             files = output.trim().split('\n').filter(Boolean).map(f => path.join(dir, f));
@@ -127,8 +136,7 @@ export class FileSynchronizer {
             } else if (stat.isFile()) {
                 // Verify it's really a file and not ignored
                 if (!this.shouldIgnore(relativePath)) {
-                    const ext = path.extname(entry.name);
-                    if (this.supportedExtensions.length > 0 && !this.supportedExtensions.includes(ext)) {
+                    if (this.supportedExtensions.length > 0 && !this.isSupported(entry.name)) {
                         continue;
                     }
                     try {

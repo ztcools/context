@@ -71,6 +71,15 @@ export class ConfigStore {
         this.persist(this.data);
     }
 
+    /** Persist the branch actually indexed (e.g. after default-branch fallback). */
+    setRepoBranch(name: string, branch: string): void {
+        const idx = this.data.repos.findIndex(r => r.name === name);
+        if (idx >= 0 && this.data.repos[idx].branch !== branch) {
+            this.data.repos[idx].branch = branch;
+            this.persist(this.data);
+        }
+    }
+
     removeRepo(name: string): boolean {
         const before = this.data.repos.length;
         this.data.repos = this.data.repos.filter(r => r.name !== name);

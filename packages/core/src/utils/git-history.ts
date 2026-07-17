@@ -1,5 +1,6 @@
 import { execSync } from 'child_process';
 import * as path from 'path';
+import { normalizeGitUrl } from './git-identity';
 
 /**
  * Git commit / diff helpers powering Git-based incremental indexing.
@@ -96,7 +97,7 @@ export function isAncestor(codebasePath: string, ancestor: string, descendant: s
 export function getRemoteUrl(codebasePath: string): string | null {
     try {
         const url = runGit('remote get-url origin', path.resolve(codebasePath));
-        return url.length > 0 ? url : null;
+        return url.length > 0 ? normalizeGitUrl(url) : null;
     } catch {
         return null;
     }
