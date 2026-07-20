@@ -28,6 +28,10 @@ ENV DEBIAN_FRONTEND=noninteractive NODE_ENV=production
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
  && rm -rf /var/lib/apt/lists/*
+# The container runs as a host uid (compose: 1015) that has no /etc/passwd entry;
+# ssh-keygen/ssh call getpwuid() and abort with "No user exists for uid". Provide
+# an entry for the deploy uid so SSH key generation and ssh clones work.
+RUN echo 'gitindex:x:1015:1015:git-index:/tmp:/usr/sbin/nologin' >> /etc/passwd
 WORKDIR /app
 # Copy the whole workspace (preserves pnpm symlink layout so core resolves + native .node files).
 COPY --from=builder /app /app
