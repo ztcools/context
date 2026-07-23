@@ -38,10 +38,6 @@ export class ToolHandlers {
      * searches skip it. Cleared naturally on server restart.
      */
     private architectureEmitted: Set<string> = new Set();
-    /** LRU cache for search query embeddings to avoid re-embedding frequent queries. */
-    private queryEmbeddingCache: Map<string, { vector: number[]; ts: number }> = new Map();
-    private static readonly QUERY_CACHE_MAX = 64;
-    private static readonly QUERY_CACHE_TTL_MS = 5 * 60 * 1000;
 
     constructor(context: Context, snapshotManager: SnapshotManager, graphToolHandlers?: GraphToolHandlers) {
         this.context = context;

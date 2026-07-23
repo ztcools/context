@@ -184,7 +184,7 @@ export class FileSynchronizer {
 
     /** Dot-directories that should NOT be automatically skipped (CI, config). */
     private static readonly ALLOWED_DOT_DIRS = new Set([
-        '.github', '.circleci', '.devcontainer', '.github',
+        '.github', '.circleci', '.devcontainer',
     ]);
 
     private shouldIgnore(relativePath: string): boolean {

@@ -92,9 +92,23 @@ END;
 
 export class SqliteGraphStore implements GraphStore {
     private db: Database.Database;
-    /** Readonly connection for search operations — avoids blocking writes during graph builds. */
+    /** Readonly connection for search — auto-created, avoids blocking writes. */
     private dbRO: Database.Database | null = null;
     private dbPath: string;
+
+    /** Connection for read queries: uses RO when available (non-blocking). */
+    private get readDB(): Database.Database {
+        if (!this.dbRO) {
+            try {
+                this.dbRO = new Database(this.dbPath, { readonly: true });
+                this.dbRO.pragma('journal_mode = WAL');
+            } catch {
+                return this.db;
+            }
+        }
+        return this.dbRO;
+    }
+
     /** Cached prepared statements to avoid re-compiling SQL on every call. */
     private upsertNodeStmt!: Database.Statement;
     private upsertEdgeSelectStmt!: Database.Statement;
@@ -258,7 +272,7 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     getNodeById(id: number): GraphNode | null {
-        const row = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+        const row = this.readDB.prepare('SELECT * FROM nodes WHERE id = ?').get(id) as Record<string, unknown> | undefined;
         return row ? this.rowToNode(row) : null;
     }
 
@@ -267,7 +281,7 @@ export class SqliteGraphStore implements GraphStore {
         if (ids.length === 0) return result;
 
         const placeholders = ids.map(() => '?').join(',');
-        const rows = this.db.prepare(
+        const rows = this.readDB.prepare(
             `SELECT * FROM nodes WHERE id IN (${placeholders})`
         ).all(...ids) as Array<Record<string, unknown>>;
 
@@ -279,7 +293,7 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     getNodeByQN(project: string, qualifiedName: string): GraphNode | null {
-        const row = this.db.prepare(
+        const row = this.readDB.prepare(
             'SELECT * FROM nodes WHERE project = ? AND qualified_name = ?'
         ).get(project, qualifiedName) as Record<string, unknown> | undefined;
         return row ? this.rowToNode(row) : null;
@@ -291,13 +305,13 @@ export class SqliteGraphStore implements GraphStore {
         const limit = options.limit ?? 200;
         const offset = options.offset ?? 0;
 
-        // Build query with optional FTS ranking
+        const rdb = this.readDB;
+
         let query: string;
         let countQuery: string;
         let countRow: { total: number };
 
         if (options.query && options.query.trim().length > 0) {
-            // BM25 full-text search via FTS5
             const ftsQuery = this.buildFtsQuery(options.query);
             query = `
                 SELECT n.*, bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
@@ -314,8 +328,8 @@ export class SqliteGraphStore implements GraphStore {
                 WHERE nodes_fts MATCH ? AND ${whereClause}
             `;
 
-            const rows = this.db.prepare(query).all(ftsQuery, ...conditionParams, limit, offset) as Array<Record<string, unknown>>;
-            countRow = this.db.prepare(countQuery).get(ftsQuery, ...conditionParams) as { total: number };
+            const rows = rdb.prepare(query).all(ftsQuery, ...conditionParams, limit, offset) as Array<Record<string, unknown>>;
+            countRow = rdb.prepare(countQuery).get(ftsQuery, ...conditionParams) as { total: number };
             return this.buildNodeResults(rows, countRow, options, offset);
         } else {
             query = `
@@ -331,8 +345,8 @@ export class SqliteGraphStore implements GraphStore {
                 WHERE ${whereClause}
             `;
 
-            const rows = this.db.prepare(query).all(...conditionParams, limit, offset) as Array<Record<string, unknown>>;
-            countRow = this.db.prepare(countQuery).get(...conditionParams) as { total: number };
+            const rows = rdb.prepare(query).all(...conditionParams, limit, offset) as Array<Record<string, unknown>>;
+            countRow = rdb.prepare(countQuery).get(...conditionParams) as { total: number };
             return this.buildNodeResults(rows, countRow, options, offset);
         }
     }
@@ -415,10 +429,10 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     getNodeDegree(nodeId: number): { inDegree: number; outDegree: number } {
-        const inRow = this.db.prepare(
+        const inRow = this.readDB.prepare(
             'SELECT COUNT(*) as cnt FROM edges WHERE target_id = ?'
         ).get(nodeId) as { cnt: number };
-        const outRow = this.db.prepare(
+        const outRow = this.readDB.prepare(
             'SELECT COUNT(*) as cnt FROM edges WHERE source_id = ?'
         ).get(nodeId) as { cnt: number };
         return { inDegree: inRow.cnt, outDegree: outRow.cnt };
@@ -433,7 +447,7 @@ export class SqliteGraphStore implements GraphStore {
 
         const placeholders = nodeIds.map(() => '?').join(',');
         // Single UNION ALL query instead of two separate queries
-        const rows = this.db.prepare(`
+        const rows = this.readDB.prepare(`
             SELECT target_id as id, COUNT(*) as in_deg, 0 as out_deg FROM edges
             WHERE target_id IN (${placeholders})
             GROUP BY target_id
@@ -493,7 +507,7 @@ export class SqliteGraphStore implements GraphStore {
         for (const id of sourceIds) resultMap.set(id, []);
 
         const placeholders = sourceIds.map(() => '?').join(',');
-        const rows = this.db.prepare(
+        const rows = this.readDB.prepare(
             `SELECT * FROM edges WHERE source_id IN (${placeholders})`
         ).all(...sourceIds) as Array<Record<string, unknown>>;
 
@@ -518,7 +532,7 @@ export class SqliteGraphStore implements GraphStore {
             query += ' AND type = ?';
             params.push(type);
         }
-        const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+        const rows = this.readDB.prepare(query).all(...params) as Array<Record<string, unknown>>;
 
         for (const row of rows) {
             const edge = this.rowToEdge(row);
@@ -535,7 +549,7 @@ export class SqliteGraphStore implements GraphStore {
             query += ' AND type = ?';
             params.push(type);
         }
-        const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+        const rows = this.readDB.prepare(query).all(...params) as Array<Record<string, unknown>>;
         return rows.map(r => this.rowToEdge(r));
     }
 
@@ -551,24 +565,24 @@ export class SqliteGraphStore implements GraphStore {
         const sql = `SELECT * FROM edges e WHERE ${conditions.join(' AND ')} LIMIT ?`;
         params.push(limit ?? 1000);
 
-        const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+        const rows = this.readDB.prepare(sql).all(...params) as Array<Record<string, unknown>>;
         return rows.map(r => this.rowToEdge(r));
     }
 
     // ── Project operations ───────────────────────────────────────
 
     listProjects(): string[] {
-        const rows = this.db.prepare(
+        const rows = this.readDB.prepare(
             'SELECT DISTINCT project FROM nodes ORDER BY project'
         ).all() as Array<{ project: string }>;
         return rows.map(r => r.project);
     }
 
     getProjectStats(project: string): { nodes: number; edges: number } {
-        const nodeRow = this.db.prepare(
+        const nodeRow = this.readDB.prepare(
             'SELECT COUNT(*) as cnt FROM nodes WHERE project = ?'
         ).get(project) as { cnt: number };
-        const edgeRow = this.db.prepare(
+        const edgeRow = this.readDB.prepare(
             'SELECT COUNT(*) as cnt FROM edges WHERE project = ?'
         ).get(project) as { cnt: number };
         return { nodes: nodeRow.cnt, edges: edgeRow.cnt };
@@ -612,10 +626,10 @@ export class SqliteGraphStore implements GraphStore {
     // ── Schema ───────────────────────────────────────────────────
 
     getSchema(): { nodeLabels: string[]; edgeTypes: string[] } {
-        const labels = this.db.prepare(
+        const labels = this.readDB.prepare(
             'SELECT DISTINCT label FROM nodes ORDER BY label'
         ).all() as Array<{ label: string }>;
-        const types = this.db.prepare(
+        const types = this.readDB.prepare(
             'SELECT DISTINCT type FROM edges ORDER BY type'
         ).all() as Array<{ type: string }>;
         return {
@@ -625,7 +639,7 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     getNodeTypeCounts(project: string): Record<string, number> {
-        const rows = this.db.prepare(
+        const rows = this.readDB.prepare(
             'SELECT label, COUNT(*) as cnt FROM nodes WHERE project = ? GROUP BY label'
         ).all(project) as Array<{ label: string; cnt: number }>;
         const result: Record<string, number> = {};
@@ -636,7 +650,7 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     getEdgeTypeCounts(project: string): Record<string, number> {
-        const rows = this.db.prepare(
+        const rows = this.readDB.prepare(
             'SELECT type, COUNT(*) as cnt FROM edges WHERE project = ? GROUP BY type'
         ).all(project) as Array<{ type: string; cnt: number }>;
         const result: Record<string, number> = {};
@@ -720,7 +734,7 @@ export class SqliteGraphStore implements GraphStore {
             const whereSQL = conditions.join(' AND ');
 
             if (returnClause.includes('*') || returnClause.includes(varName)) {
-                const rows = this.db.prepare(`SELECT * FROM nodes n WHERE ${whereSQL}`).all(...params) as Array<Record<string, unknown>>;
+                const rows = this.readDB.prepare(`SELECT * FROM nodes n WHERE ${whereSQL}`).all(...params) as Array<Record<string, unknown>>;
                 return { rows };
             }
         }
@@ -768,7 +782,7 @@ export class SqliteGraphStore implements GraphStore {
         if (!node) return;
 
         const props = { ...node.properties, ...updates };
-        this.db.prepare('UPDATE nodes SET properties_json = ? WHERE id = ?').run(JSON.stringify(props), id);
+        this.readDB.prepare('UPDATE nodes SET properties_json = ? WHERE id = ?').run(JSON.stringify(props), id);
     }
 
     private buildFtsQuery(query: string): string {

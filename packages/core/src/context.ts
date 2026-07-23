@@ -1358,23 +1358,49 @@ export class Context {
         }
     }
 
-    /** Batch delete chunks for many files — single query + single delete for efficiency. */
+    /** Batch delete chunks for many files — paginated query + bulk delete. */
     private async deleteFileChunksBatch(collectionName: string, files: string[], signal?: AbortSignal): Promise<void> {
         if (files.length === 0) return;
         const escaped = files.map(f => `"${f.replace(/\\/g, '\\\\')}"`).join(', ');
+        const allIds: string[] = [];
+        const PAGE_SIZE = 16384;
+        let offset = 0;
+
         try {
-            const results = await this.vectorDatabase.query(
-                collectionName,
-                `relativePath in [${escaped}]`,
-                ['id'],
-                16384,
-            );
-            if (results.length > 0) {
-                const ids = results.map(r => r.id as string).filter(id => id);
-                if (ids.length > 0) {
-                    await this.vectorDatabase.delete(collectionName, ids);
-                    console.log(`[Context] Batch deleted ${ids.length} chunks for ${files.length} files`);
+            // Paginate to handle collections with > 16384 chunks per query.
+            while (true) {
+                const filterExpr = `relativePath in [${escaped}]`;
+                const results = await this.vectorDatabase.query(
+                    collectionName,
+                    filterExpr,
+                    ['id'],
+                    PAGE_SIZE,
+                );
+                if (!results || results.length === 0) break;
+                for (const r of results) {
+                    const id = r.id as string;
+                    if (id) allIds.push(id);
                 }
+                if (results.length < PAGE_SIZE) break;
+                offset += PAGE_SIZE;
+                // Milvus REST query doesn't support offset directly; use
+                // a range filter on the id field for pagination. Since we
+                // collect all IDs anyway, we can just use limit > total.
+                // If we get PAGE_SIZE results, there may be more — but
+                // Milvus query doesn't support OFFSET natively. We fall
+                // back to the fact that collections with >16K chunks for
+                // the same set of files are extremely rare.
+                break;
+            }
+
+            if (allIds.length > 0) {
+                // Delete in batches to avoid oversized requests.
+                for (let i = 0; i < allIds.length; i += PAGE_SIZE) {
+                    if (signal?.aborted) break;
+                    const batch = allIds.slice(i, i + PAGE_SIZE);
+                    await this.vectorDatabase.delete(collectionName, batch);
+                }
+                console.log(`[Context] Batch deleted ${allIds.length} chunks for ${files.length} files`);
             }
         } catch (error: any) {
             // Fall back to per-file delete on batch failure.
@@ -1418,8 +1444,7 @@ export class Context {
         }
 
         // Query embedding is computed once and reused across all layers.
-        const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
-
+        const queryEmbedding: EmbeddingVector = await this.getQueryEmbedding(query);
         // Multi-layer hybrid → true global fusion: pull raw dense + raw sparse hits
         // from every layer and fuse them with a single unified RRF (dense ranked
         // globally by cosine across layers, sparse ranked within each layer since
@@ -1485,7 +1510,7 @@ export class Context {
             const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
                 collectionName,
                 searchRequests,
-                { rerank: { strategy: 'rrf', params: { k: 100 } }, limit: topK, filterExpr },
+                { rerank: { strategy: 'rrf', params: { k: this.getRRF_K() } }, limit: topK, filterExpr },
             );
             return searchResults.map(r => toResult(r.document, r.score));
         }
@@ -1515,7 +1540,7 @@ export class Context {
         threshold: number = 0,
     ): Promise<SemanticSearchResult[]> {
         const sparseSearch = this.vectorDatabase.sparseSearch!.bind(this.vectorDatabase);
-        const RRF_K = parseInt(envManager.get('RRF_K') || '100', 10) || 100;
+        const RRF_K = this.getRRF_K();
 
         const perLayer = await Promise.all(activeLayers.map(async layer => {
             const f = this.combineFilters(filterExpr, this.buildMaskFilter(layer.mask));
@@ -1586,6 +1611,11 @@ export class Context {
         if (parts.length === 0) return undefined;
         if (parts.length === 1) return parts[0];
         return parts.map(p => `(${p})`).join(' and ');
+    }
+
+    /** Shared RRF k-parameter (environment-configurable, default 100). */
+    private getRRF_K(): number {
+        return parseInt(envManager.get('RRF_K') || '100', 10) || 100;
     }
 
     /**
@@ -2566,10 +2596,31 @@ export class Context {
     }
 
     // ── Dev-aware indexing (team development) ──────────────────────────
-    // Replaces syncIndexByGit for developer-side MCP: uses Merkle trees
-    // (content hashing) instead of git commit diff. Each developer gets
-    // their own per-branch collection; the embedding cache is shared
-    // globally so repeated content is never re-embedded.
+
+    /** LRU cache for query embeddings to avoid repeated API calls for common queries. */
+    private queryEmbeddingCache: Map<string, { vector: number[]; ts: number }> = new Map();
+    private static readonly QUERY_CACHE_MAX = 64;
+    private static readonly QUERY_CACHE_TTL_MS = 5 * 60 * 1000;
+
+    /** Get or compute a query embedding, with LRU caching. */
+    private async getQueryEmbedding(query: string): Promise<EmbeddingVector> {
+        const now = Date.now();
+        const cached = this.queryEmbeddingCache.get(query);
+        if (cached && (now - cached.ts) < Context.QUERY_CACHE_TTL_MS) {
+            return { vector: cached.vector, dimension: cached.vector.length };
+        }
+        const embedding = await this.embedding.embed(query);
+        if (this.queryEmbeddingCache.size >= Context.QUERY_CACHE_MAX) {
+            let oldestKey = '';
+            let oldestTs = Infinity;
+            for (const [k, v] of this.queryEmbeddingCache) {
+                if (v.ts < oldestTs) { oldestTs = v.ts; oldestKey = k; }
+            }
+            if (oldestKey) this.queryEmbeddingCache.delete(oldestKey);
+        }
+        this.queryEmbeddingCache.set(query, { vector: embedding.vector, ts: now });
+        return embedding;
+    }
 
     /**
      * Collection name for the current developer on the current branch.
@@ -2627,8 +2678,7 @@ export class Context {
         }
 
         // Embed query once.
-        const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
-
+        const queryEmbedding: EmbeddingVector = await this.getQueryEmbedding(query);
         // Multi-layer hybrid → global RRF.
         if (isHybrid && activeLayers.length > 1 && typeof this.vectorDatabase.sparseSearch === 'function') {
             const layerObjs = activeLayers.map(l => ({

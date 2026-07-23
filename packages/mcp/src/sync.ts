@@ -74,7 +74,7 @@ export class SyncManager {
     }
 
     private getSyncLockStaleMs(): number {
-        const value = process.env[SYNC_LOCK_STALE_ENV];
+        const value = envManager.get(SYNC_LOCK_STALE_ENV);
         if (!value) {
             return DEFAULT_SYNC_LOCK_STALE_MS;
         }
