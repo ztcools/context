@@ -41,27 +41,39 @@ claude-context 是一套代码索引与检索系统，核心价值：
 4. /etc/machine-id                 （终极兜底）
 ```
 
+指纹格式为 `<slug>_<hash>`（12 字符 slug + 4 字符 MD5），防止相似 email 碰撞（如 `alice.johnson@c.com` 和 `alice.johnson-smith@c.com`）。第一次计算后缓存到 `~/.claude-context/dev-id`，持久稳定。
+
 ### 索引流程（Merkle 内容追踪）
 
 ```
-1. 扫描工作树 → 计算每个文件的 SHA256 内容哈希
-2. 对比上次 Merkle 快照 → 检测增/删/改
-3. 变化文件 → 切 chunk → 查 embedding cache → 嵌入 miss 部分
-4. 写入 dev 个人 collection (Milvus)
-5. 保存新的 Merkle 快照（本地文件）
+1. 扫描工作树 → 计算每个文件的 SHA256 内容哈希（>10MB 文件流式 hash，防 OOM）
+2. 对比上次 Merkle 快照（status: clean/dirty）→ 检测增/删/改
+   - 快照标记 dirty 且索引未完成 → 全量重索引（防"幽灵 up-to-date"）
+   - 干净快照 → 增量对比上次哈希
+3. 先批量删除 removed + modified 文件的旧 chunks（deleteFileChunksBatch）
+4. 变化文件 → 切 chunk → 查 embedding cache → 嵌入 miss 部分
+   - Embedding API 指数退避重试 3 次（auth/quota 等 fatal 错误不重试）
+   - 失败 chunk 进入 retryBuffer，批次结束时重试一次
+5. 写入 dev 个人 collection (Milvus)
+6. 索引成功 → markClean() 保存 Merkle 快照（status: clean）
 ```
 
-**关键**：不依赖 git commit SHA。git reset/rebase/merge 导致的文件变化被 Merkle 自然检测，内容相同的文件零成本跳过。
+**关键**：不依赖 git commit SHA。git reset/rebase/merge 导致的文件变化被 Merkle 自然检测，内容相同的文件零成本跳过。快照的 `status: clean/dirty` 标记防止进程崩溃后误报"up-to-date"。
 
 ### 搜索流程（dev ⊕ root 两层）
 
 ```
 search 时：
   layer 1: dev collection (hcc_repo_branch_devId)  ← 完整的个人工作树快照
-  layer 2: root collection (hcc_repo_main)          ← fallback（dev 未索引时）
+  layer 2: root collection (hcc_repo_main)          ← 共享仓库基线，补充 dev 未覆盖的文件
 
-同一文件在 dev 和 root 中都有时，dev 版本优先（更高层覆盖底层）。
+两层始终同时搜索（不是二选一）：
+  - globalHybridFusion 跨层 RRF 融合：dense 全局排名 + sparse 层内排名 → 统一重排序
+  - deduplicateResults（>50% 行重叠去重）自然消解相同文件冲突
+  - dev 和 root 都有某个文件时，RRF 排序决定优先级（高分者胜）
 ```
+
+查询嵌入向量缓存（LRU, 64 条, TTL=5min），相同 query 不重复调用 embedding API。
 
 ### 团队场景行为
 
@@ -130,12 +142,15 @@ core ──→ 独立（Milvus SDK + embedding providers）
 
 ### 索引模式选择 (syncIndexByMerkle)
 ```
-if 首次索引（无 Merkle 快照）:
+if 快照 status=dirty（上次索引被中断）:
+  → 全量重索引（修复 > 增量覆盖）
+elif 首次索引（无 Merkle 快照）:
   → 所有文件都是 "new" → 全量索引到 dev collection
 elif Merkle 对比无变化:
   → up-to-date，零操作
 else:
-  → 只处理增/删/改文件 → 增量索引到 dev collection
+  → 只处理增/删/改文件 → 批量删旧 + 增量索引到 dev collection
+  → 索引成功 → markClean() 保存 clean 快照
 ```
 
 ## 技术栈
@@ -154,7 +169,7 @@ else:
 
 ## 核心模块速查
 
-### core — src/context.ts (核心类, ~2500行)
+### core — src/context.ts (核心类, ~2700行)
 - `Context` 类：一切的总入口。构造函数接受 `embedding` + `vectorDatabase` + `splitter`
 - `indexCodebase()` — 全量索引（服务端使用）
 - `syncIndexByGit()` — Git 增量索引（**服务端 git-index-service 使用**，基于 commit diff）
@@ -162,7 +177,12 @@ else:
 - `semanticSearch()` — 多层 hybrid 搜索，跨 layer global RRF 融合
 - `searchWithLayers()` — **显式层搜索**，调用方提供 collection 列表（不依赖 CommitIndexState）
 - `getDevCollectionName()` / `getRootCollectionName()` — dev-aware 集合命名
-- `processChunkBatch()` — 嵌入缓存：先查 Milvus 缓存再调 API
+- `getQueryEmbedding()` — 查询嵌入 LRU 缓存（64 条, TTL=5min），避免重复 API 调用
+- `deleteFileChunksBatch()` — 批量删除（收集多文件 ID → 一次 delete），fallback 到逐文件
+- `getRRF_K()` — 统一读取 RRF k 参数（环境变量 `RRF_K`，默认 100）
+- `applyScoreCutoff()` — 统一阈值过滤（相对比率，dense 和 hybrid/RRF 模式均生效）
+- `processChunkBatch()` — 嵌入缓存：先查 Milvus 缓存 → embedding 指数退避重试（3次）→ 写入
+- `prepareDevCollection()` — 创建 dev 专用 collection
 - `collectionNamePattern`: `hcc_<repo>_<md5hash>` （identity = `gitUrl:branch:devFingerprint`）
 
 关键环境变量（通过 `envManager` 读取）：
@@ -172,6 +192,9 @@ else:
 - `EMBEDDING_CACHE_ENABLED` (默认 true)
 - `CUSTOM_EXTENSIONS`, `CUSTOM_IGNORE_PATTERNS`
 - `CLAUDE_CONTEXT_DEV_ID` — **可选**，显式设置开发者身份（未设置时自动使用 git email）
+- `RRF_K` — RRF 融合 k 参数（默认 100）
+- `INDEX_CHUNK_LIMIT` — 单次索引 chunk 上限（默认 450000）
+- `SEARCH_DEFAULT_LIMIT`, `SEARCH_THRESHOLD`, `SEARCH_SNIPPET_MAX_CHARS`, `SEARCH_SCORE_RATIO` — 搜索调优
 - `GIT_ROOT_BRANCHES` — root 分支名（默认 main,master，仅服务端使用）
 - `GIT_INCREMENTAL_ENABLED`, `GIT_LAYERED_ENABLED` — 服务端索引开关
 
@@ -183,13 +206,19 @@ else:
 - 统一接口 `Embedding`，实现：`OpenAIEmbedding`, `VoyageAIEmbedding`, `GeminiEmbedding`, `OllamaEmbedding`
 
 ### core/src/vectordb/ — 向量数据库
-- `MilvusVectorDatabase` — dense + sparse (BM25) hybrid 搜索
-- `milvus-restful-vectordb.ts` — RESTful API 版本
+- `MilvusVectorDatabase`（gRPC）— dense + sparse (BM25) hybrid 搜索
+  - `withLoadRetry()` — 检测 Milvus 重启/卸载等瞬态错误，自动清除 load 缓存并重试一次
+- `MilvusRestfulVectorDatabase`（REST）— 完整实现 sparseSearch，支持跨层 global RRF
 
 ### core/src/sync/ — 文件同步
 - `FileSynchronizer` — 基于 Merkle 树的文件变更检测，支持 dev identity override
   - 每开发者每分支独立 Merkle 快照（`~/.claude-context/merkle/<identity-hash>.json`）
-- `MerkleTree` — 内容哈希 Merkle 树实现
+  - 快照含 `status: clean/dirty` 标记：dirty 表示上次索引被中断，下次全量重索引
+  - 允许 dot-dirs（`.github`, `.circleci`, `.devcontainer`）和 dot-files（`.eslintrc.js` 等）
+  - 大文件（>10MB）使用流式 SHA256 hash，防 OOM
+  - `git ls-files` 获取文件列表后在 JS 侧过滤扩展名，避免命令行超长
+  - `markClean()` / `isDirty()` — 索引完成后标记快照干净
+- `MerkleDAG` — 内容哈希 DAG，紧凑型根节点哈希
 
 ### core/src/cache/ — 嵌入缓存
 - `EmbeddingCache` 接口 → `MilvusEmbeddingCache` / `NoopEmbeddingCache`
@@ -202,14 +231,19 @@ else:
 ### core/src/utils/ — 工具
 - `git-identity.ts` — `getRepoIdentity()`: `gitRemote:branch`
 - `dev-fingerprint.ts` — **开发者身份标识**：`getDevFingerprint()` / `getDevRepoIdentity()` / `getBranchIdentity()`
-  - 三级解析：`CLAUDE_CONTEXT_DEV_ID` env → `git config user.email` → `hostname`
+  - 三级解析：`CLAUDE_CONTEXT_DEV_ID` env → `git config user.email` → `hostname` → `/etc/machine-id`
+  - 指纹格式 `<slug>_<hash>`（12 字符 + 4 字符 MD5），防相似 email 碰撞
   - 缓存到 `~/.claude-context/dev-id`，持久稳定
 - `git-history.ts` — git 历史操作：diff changed files、commit 查询（服务端使用）
 - `glob-matcher.ts` — glob 模式匹配
-- `env-manager.ts` — 环境变量管理（缓存 + 热更新）
+- `env-manager.ts` — 环境变量管理
+  - 缓存 `.env` 文件内容（30s TTL），避免热路径磁盘 I/O
+  - 支持 dotenv 标准语法：引号、注释（`#`/`//`）、`export` 前缀
+  - 优先级：`process.env` > `.env` 文件
 
 ### graph — 知识图谱
-- `SqliteGraphStore` — 带 FTS5 全文索引的 SQLite 存储
+- `SqliteGraphStore` — 带 FTS5 全文索引的 SQLite 存储（WAL 模式）
+  - `getReadonlyDB()` — 只读副本连接，搜索/查询时使用，避免后台构建阻塞读操作
 - `GraphExtractor` — tree-sitter AST 提取节点和边
 - `CallTracer` — 调用链追踪（BFS），支持 inbound/outbound/both
 - `GraphSearcher` — BM25+FTS 图搜索
@@ -221,13 +255,18 @@ else:
 ### mcp — MCP 服务
 - `src/index.ts` — 入口，`ContextMcpServer` 类
   - 关键：`console.log` 重定向到 stderr，stdout 只走 MCP JSON 协议
+  - `shutdown()` — 优雅退出：停止后台同步、释放全局锁、关闭 graph store
+  - SIGINT/SIGTERM 信号处理调用 shutdown
 - `src/handlers.ts` — 4 个 MCP Tool handler（全部 dev-aware）：
-  - `handleIndex` — 使用 `syncIndexByMerkle` 索引到 dev collection
-  - `handleSearchCode` — 使用 `searchWithLayers` 搜 dev + root 两层
-  - `handleClearIndex` — 清除 dev collection + Merkle 快照
+  - `handleIndex` — 使用 `syncIndexByMerkle` 索引到 dev collection（背景执行）
+  - `handleSearchCode` — 使用 `searchWithLayers` 搜 dev ⊕ root 两层（始终同时搜索）
+  - `handleClearIndex` — 取消在途索引 → 清除 dev collection + Merkle 快照 + graph index
   - `handleStatus` — 检查 dev + root 两层索引状态
+  - `enrichWithGraphContextDeep()` — 3 层图增强：直接调用关系 → BFS 调用链 → 架构摘要
 - `src/graph-handlers.ts` — 图操作 handler：`handleIndexRepository`（3 阶段）、`handleSearchGraph`、`handleTracePath`、`handleGetArchitecture`等
 - `src/sync.ts` — 后台自动同步（默认每 5 分钟，使用 `syncIndexByMerkle`）
+  - 全局锁 stale 阈值 2 分钟（兜底回收），可通过 `CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS` 调整
+  - 文件变更触发器（`~/.context/.sync-trigger`）+ 2s 消抖
 - `src/config.ts` — MCP 配置解析（环境变量 → `ContextMcpConfig`）
 - `src/snapshot.ts` — 代码库快照管理（v2 格式）
 
@@ -298,8 +337,20 @@ pnpm --filter @seeway/claude-context-mcp test
 
 ## 最近开发重点（2026-07）
 
+- **P0 审计修复**（2026-07-23）：
+  - 真正的 dev ⊕ root 两层搜索（不再二选一）
+  - Merkle 快照 dirty/clean 标记 → 防"幽灵 up-to-date"
+  - `syncIndexByMerkle` 移除 monkey-patching → `collectionNameOverride` 参数传递
+  - Milvus load 缓存自动失效 + 重试（防重启后搜索失败）
+  - Embedding API 指数退避重试（3次）+ fatal 错误跳过
+  - Embedding 缓存错误分类处理（维度/主键/其他）
+  - 全局 dotfiles 跳过 → 允许 `.github/.circleci/.devcontainer` 和 dot-files
+  - DevFingerprint 追加 4 字符 hash 防碰撞
+  - 优雅退出释放锁 + 关闭 store
+- **P1 优化**：chunk 失败 retryBuffer、batch delete、abort 每 batch 检查、threshold 全模式生效
+- **P2 性能**：envManager 缓存、query embedding LRU、RRF_K 可配、INDEX_CHUNK_LIMIT 可配
 - **Dev-aware 索引架构**：开发者私有索引 + Merkle 内容追踪，对 git reset/rebase/stash 免疫
-- **DevFingerprint**：稳定开发者身份标识（env/git-email/hostname 三级）
+- **DevFingerprint**：稳定开发者身份标识（env/git-email/hostname/machine-id 四级）
 - **embedding cache**：全局共享向量缓存，跨开发者/跨分支复用
 - 性能优化：Worker Threads 并行解析、批量 SQL、事件循环不阻塞
 - 知识图谱自动构建（首次 search 触发）

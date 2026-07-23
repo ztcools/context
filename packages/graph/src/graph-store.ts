@@ -782,7 +782,7 @@ export class SqliteGraphStore implements GraphStore {
         if (!node) return;
 
         const props = { ...node.properties, ...updates };
-        this.readDB.prepare('UPDATE nodes SET properties_json = ? WHERE id = ?').run(JSON.stringify(props), id);
+        this.db.prepare('UPDATE nodes SET properties_json = ? WHERE id = ?').run(JSON.stringify(props), id);
     }
 
     private buildFtsQuery(query: string): string {
