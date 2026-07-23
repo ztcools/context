@@ -32,11 +32,13 @@ claude-context 是一套代码索引与检索系统，核心价值：
 
 ### 索引身份 = `gitRemote:branch:devFingerprint`
 
-开发者指纹（[dev-fingerprint.ts](packages/core/src/utils/dev-fingerprint.ts)）：
+开发者指纹（[dev-fingerprint.ts](packages/core/src/utils/dev-fingerprint.ts)），**零配置自动生效**：
+
 ```
-1. CLAUDE_CONTEXT_DEV_ID env       （显式设置，团队可控）
-2. git config user.email           （自动，推荐）
-3. hostname                        （fallback）
+1. CLAUDE_CONTEXT_DEV_ID env       （可选覆盖，团队统一标识时使用）
+2. git config user.email           （默认，自动获取 — git 团队开发必须配置）
+3. hostname                        （兜底）
+4. /etc/machine-id                 （终极兜底）
 ```
 
 ### 索引流程（Merkle 内容追踪）
@@ -169,7 +171,7 @@ else:
 - `HYBRID_MODE` (默认 true), `EMBEDDING_BATCH_SIZE` (默认 100)
 - `EMBEDDING_CACHE_ENABLED` (默认 true)
 - `CUSTOM_EXTENSIONS`, `CUSTOM_IGNORE_PATTERNS`
-- `CLAUDE_CONTEXT_DEV_ID` — **显式设置开发者身份**（可选，用于团队内稳定标识）
+- `CLAUDE_CONTEXT_DEV_ID` — **可选**，显式设置开发者身份（未设置时自动使用 git email）
 - `GIT_ROOT_BRANCHES` — root 分支名（默认 main,master，仅服务端使用）
 - `GIT_INCREMENTAL_ENABLED`, `GIT_LAYERED_ENABLED` — 服务端索引开关
 

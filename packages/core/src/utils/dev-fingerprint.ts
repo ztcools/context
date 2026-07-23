@@ -9,13 +9,17 @@ import { getRepoIdentity } from './git-identity';
  * Developer fingerprint — a stable, persistent identifier that distinguishes
  * one developer's index from another's on the same branch.
  *
- * Resolution order:
- *   1. CLAUDE_CONTEXT_DEV_ID env var         (explicit, team-manageable)
- *   2. git config user.email                  (per-repo identity)
- *   3. hostname                               (fallback)
+ * **零配置自动生效**：git 团队开发必须配置 `user.email`（git 自身要求），
+ * 该 email 自动作为开发者标识，无需任何额外配置。
+ *
+ * Resolution order（按优先级自动选择第一个可用值）:
+ *   1. CLAUDE_CONTEXT_DEV_ID env var         （可选，团队强制统一标识）
+ *   2. git config user.email                  （默认，自动获取，推荐）
+ *   3. hostname                               （兜底，git 不可用时）
+ *   4. /etc/machine-id                        （终极兜底）
  *
  * The fingerprint is cached to ~/.claude-context/dev-id so it survives
- * reboots and MCP restarts.
+ * reboots and MCP restarts. 缓存后的值不会因环境变化而改变，保证稳定。
  */
 
 const DEV_ID_CACHE_DIR = path.join(os.homedir(), '.claude-context');
