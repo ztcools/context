@@ -378,6 +378,42 @@ export class MilvusVectorDatabase implements VectorDatabase {
         });
     }
 
+    /** Clear the load-state cache for a collection (called on transient failures). */
+    invalidateLoadCache(collectionName: string): void {
+        this.loadedCollections.delete(collectionName);
+    }
+
+    /**
+     * Execute a Milvus operation with automatic cache invalidation on load-state
+     * errors (e.g. Milvus restarted -> collection unloaded). Retries once.
+     */
+    private async withLoadRetry<T>(
+        collectionName: string,
+        operation: () => Promise<T>,
+    ): Promise<T> {
+        try {
+            return await operation();
+        } catch (error: any) {
+            const msg = error?.message || String(error);
+            const isLoadError =
+                msg.includes('load') ||
+                msg.includes('not loaded') ||
+                msg.includes('LoadNotExist') ||
+                msg.includes('collection not loaded') ||
+                msg.includes('UNAVAILABLE') ||
+                msg.includes('connection');
+
+            if (isLoadError && this.loadedCollections.has(collectionName)) {
+                console.warn(`[MilvusDB] ⚠️  Load-state error for '${collectionName}', clearing cache and retrying: ${msg}`);
+                this.loadedCollections.delete(collectionName);
+                await this.ensureLoaded(collectionName);
+                return await operation();
+            }
+
+            throw error;
+        }
+    }
+
     async search(collectionName: string, queryVector: number[], options?: SearchOptions): Promise<VectorSearchResult[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
@@ -398,7 +434,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
             searchParams.expr = options.filterExpr;
         }
 
-        const searchResult = await this.client.search(searchParams);
+        const searchResult = await this.withLoadRetry(collectionName, () =>
+            this.client!.search(searchParams)
+        );
 
         if (!searchResult.results || searchResult.results.length === 0) {
             return [];
@@ -449,7 +487,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
             searchParams.expr = options.filterExpr;
         }
 
-        const searchResult = await this.client.search(searchParams);
+        const searchResult = await this.withLoadRetry(collectionName, () =>
+            this.client!.search(searchParams)
+        );
 
         if (!searchResult.results || searchResult.results.length === 0) {
             return [];
@@ -521,7 +561,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 queryParams.limit = 16384; // Default limit for unfiltered queries
             }
 
-            const result = await this.client.query(queryParams);
+            const result = await this.withLoadRetry(collectionName, () =>
+                this.client!.query(queryParams)
+            );
 
             if (result.status.error_code !== 'Success') {
                 throw new Error(`Failed to query Milvus: ${result.status.reason}`);
@@ -757,7 +799,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 expr: searchParams.expr
             }, null, 2));
 
-            const searchResult = await this.client.search(searchParams);
+            const searchResult = await this.withLoadRetry(collectionName, () =>
+                this.client!.search(searchParams)
+            );
 
             console.log(`[MilvusDB] 🔍 Search executed, processing results...`);
 
@@ -928,11 +972,13 @@ export class MilvusVectorDatabase implements VectorDatabase {
             // count(*) requires the collection to be loaded.
             await this.ensureLoaded(collectionName);
 
-            const result = await this.client.query({
-                collection_name: collectionName,
-                output_fields: ['count(*)'],
-                expr: '',
-            });
+            const result = await this.withLoadRetry(collectionName, () =>
+                this.client!.query({
+                    collection_name: collectionName,
+                    output_fields: ['count(*)'],
+                    expr: '',
+                })
+            );
             if (result.status.error_code !== 'Success') {
                 console.warn(`[MilvusDB] count(*) query failed for '${collectionName}': ${result.status.reason}`);
                 return -1;

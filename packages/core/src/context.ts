@@ -1280,57 +1280,30 @@ export class Context {
         let limitReached = false;
 
         if (filesToIndex.length > 0 && !signal?.aborted) {
-            // Temporarily override collection name so processFileList writes to
-            // the dev-specific collection.
-            const originalGetName = this.getCollectionName.bind(this);
-            const devAwareGetName = (p: string) => devCollectionName;
+            const result = await this.processFileList(
+                filesToIndex,
+                codebasePath,
+                (filePath, fileIndex, totalFiles) => {
+                    const pct = Math.round((fileIndex / totalFiles) * 100);
+                    progressCallback?.({ phase: `Indexing (${fileIndex}/${totalFiles})...`, current: fileIndex, total: totalFiles, percentage: pct });
+                },
+                splitter,
+                signal,
+                devCollectionName, // write directly to dev collection — no monkey-patching
+            );
+            processedFiles = result.processedFiles;
+            totalChunks = result.totalChunks;
+            limitReached = result.status === 'limit_reached';
+        }
 
-            // We need processFileList to write to devCollectionName.
-            // processFileList calls this.getCollectionName(codebasePath) — but
-            // we want it to return devCollectionName. The cleanest way is to
-            // temporarily swap: override collectionNameOverride then restore.
-            const savedOverride = this.collectionNameOverride;
-            // Use a synthetic override that includes the dev suffix.
-            // getCollectionName will use getCollectionNameForIdentity which
-            // already hashes the full identity. So we need a different approach.
-            //
-            // Actually, the simplest fix: make processFileList accept an optional
-            // collectionName parameter. But that's a bigger refactor.
-            //
-            // Alternative: just use the dev-aware getCollectionName.
-            // getCollectionName calls getRepoIdentityCached which returns
-            // url:branch. We need url:branch:devId.
-            //
-            // Let's temporarily override the identity cache.
-            const origCached = this.getRepoIdentityCached.bind(this);
-            const cachedDevIdentity = devIdentity;
-            // @ts-ignore — temporary override for this indexing pass
-            const patchedGetRepoIdentityCached = (_p: string) => cachedDevIdentity;
-            (this as any).getRepoIdentityCached = patchedGetRepoIdentityCached;
-
-            try {
-                const result = await this.processFileList(
-                    filesToIndex,
-                    codebasePath,
-                    (filePath, fileIndex, totalFiles) => {
-                        const pct = Math.round((fileIndex / totalFiles) * 100);
-                        progressCallback?.({ phase: `Indexing (${fileIndex}/${totalFiles})...`, current: fileIndex, total: totalFiles, percentage: pct });
-                    },
-                    splitter,
-                    signal,
-                );
-                processedFiles = result.processedFiles;
-                totalChunks = result.totalChunks;
-                limitReached = result.status === 'limit_reached';
-            } finally {
-                // Restore original identity cache function.
-                (this as any).getRepoIdentityCached = origCached;
-            }
+        // Mark the Merkle snapshot as clean now that chunk processing succeeded.
+        // If we crashed before this point, the dirty flag ensures the next sync
+        // treats all files as "added" instead of falsely reporting "up-to-date".
+        if (synchronizer) {
+            await synchronizer.markClean();
         }
 
         if (isFirstIndex) {
-            // First index is conceptually a "full" for this dev, since we had
-            // no prior snapshot and all files were treated as "added".
             console.log(`[Context] ✅ Dev-aware first index complete: ${processedFiles} files, ${totalChunks} chunks`);
         } else {
             console.log(`[Context] ✅ Dev-aware Merkle sync complete: +${added.length}/~${modified.length}/-${removed.length}, ${processedFiles} files, ${totalChunks} chunks`);
@@ -1866,7 +1839,8 @@ export class Context {
         codebasePath: string,
         onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
         splitter: Splitter = this.codeSplitter,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        collectionNameOverride?: string,
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
@@ -1908,7 +1882,7 @@ export class Context {
                     // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
                         try {
-                            await this.processChunkBuffer(chunkBuffer, signal);
+                            await this.processChunkBuffer(chunkBuffer, signal, collectionNameOverride);
                             chunkBuffer = []; // Clear on success
                         } catch (error) {
                             // Embedding errors (such as API having no quota) halt the entire indexing process and propagate upwards.
@@ -1955,7 +1929,7 @@ export class Context {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
             console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
             try {
-                await this.processChunkBuffer(chunkBuffer, signal);
+                await this.processChunkBuffer(chunkBuffer, signal, collectionNameOverride);
             } catch (error) {
                 if (error instanceof EmbeddingError) {
                     throw error;
@@ -1983,7 +1957,8 @@ export class Context {
  */
     private async processChunkBuffer(
         chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        collectionNameOverride?: string,
     ): Promise<void> {
         if (chunkBuffer.length === 0) return;
         if (signal?.aborted) return;
@@ -1998,16 +1973,17 @@ export class Context {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid' : 'regular';
         console.log(`[Context] 🔄 Processing batch of ${chunks.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
-        await this.processChunkBatch(chunks, codebasePath);
+        await this.processChunkBatch(chunks, codebasePath, collectionNameOverride);
     }
 
     /**
      * Process a batch of chunks
      */
-    private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
+    private async processChunkBatch(chunks: CodeChunk[], codebasePath: string, collectionNameOverride?: string): Promise<void> {
         const isHybrid = this.getIsHybrid();
         const repoIdentity = this.getRepoIdentityCached(codebasePath);
         const commit = this.currentIndexCommit || '';
+        const targetCollection = collectionNameOverride || this.getCollectionName(codebasePath);
 
         // ── Content-hash embedding cache ──────────────────────────────
         // Hash every chunk, reuse any vectors already computed (by this repo,
@@ -2087,7 +2063,7 @@ export class Context {
             });
 
             // Store to vector database
-            await this.vectorDatabase.insertHybrid(this.getCollectionName(codebasePath), documents);
+            await this.vectorDatabase.insertHybrid(targetCollection, documents);
         } else {
             // Create regular vector documents
             const documents: VectorDocument[] = chunks.map((chunk, index) => {
@@ -2101,7 +2077,7 @@ export class Context {
 
                 return {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
-                    vector: vectors[index], // Dense vector (cached or freshly embedded)
+                    vector: vectors[index],
                     content: chunk.content,
                     relativePath,
                     startLine: chunk.metadata.startLine || 0,
@@ -2109,17 +2085,16 @@ export class Context {
                     fileExtension,
                     metadata: {
                         ...restMetadata,
-                        codebasePath: repoIdentity, // 这里替换成 url:branch
+                        codebasePath: repoIdentity,
                         language: chunk.metadata.language || 'unknown',
                         chunkIndex: index,
-                        chunkHash: hashes[index], // content hash for dedup / cache
-                        commit // HEAD commit this chunk was indexed at
+                        chunkHash: hashes[index],
+                        commit
                     }
                 };
             });
 
-            // Store to vector database
-            await this.vectorDatabase.insert(this.getCollectionName(codebasePath), documents);
+            await this.vectorDatabase.insert(targetCollection, documents);
         }
     }
 
@@ -2350,13 +2325,20 @@ export class Context {
     private matchesIgnorePattern(filePath: string, basePath: string, ignorePatterns: string[] = this.ignorePatterns): boolean {
         const relativePath = path.relative(basePath, filePath);
 
-        // Always ignore dotfiles/dotdirs to stay aligned with
-        // FileSynchronizer.shouldIgnore. If these traversals diverge, files
-        // indexed here are never hashed by the synchronizer and their stale
-        // chunks linger in Milvus forever.
-        if (relativePath.split(path.sep).some(part => part.startsWith('.'))) {
-            return true;
-        }
+        // Always ignore dotfiles/dotdirs (aligned with FileSynchronizer).
+        // Well-known CI/config dot-dirs (.github, .circleci) and dot-files
+        // (.eslintrc.js) are allowed — see FileSynchronizer.ALLOWED_DOT_DIRS.
+        const pathParts = relativePath.split(path.sep);
+        const ALLOWED_DOT_DIRS = new Set(['.github', '.circleci', '.devcontainer']);
+        const hasDot = pathParts.some(part => {
+            if (!part.startsWith('.')) return false;
+            if (part === pathParts[pathParts.length - 1]) {
+                const ext = part.includes('.', 1);
+                if (ext) return false; // dot-file → allow
+            }
+            return !ALLOWED_DOT_DIRS.has(part);
+        });
+        if (hasDot) return true;
 
         if (ignorePatterns.length === 0) {
             return false;

@@ -18,6 +18,8 @@ export class FileSynchronizer {
     private supportedFilenames: string[];
     /** Explicit identity override for dev-aware snapshots (url:branch:devId). */
     private identityOverride?: string;
+    /** Whether the snapshot is in a "dirty" state (indexing not yet completed). */
+    private dirty: boolean = false;
 
     constructor(
         rootDir: string,
@@ -168,12 +170,29 @@ export class FileSynchronizer {
         return fileHashes;
     }
 
+    /** Dot-directories that should NOT be automatically skipped (CI, config). */
+    private static readonly ALLOWED_DOT_DIRS = new Set([
+        '.github', '.circleci', '.devcontainer', '.github',
+    ]);
+
     private shouldIgnore(relativePath: string): boolean {
-        // Always ignore hidden files and directories (starting with .)
+        // Skip hidden files and directories (starting with "."), unless
+        // the directory is a well-known CI/config directory.
         const pathParts = relativePath.split(path.sep);
-        if (pathParts.some(part => part.startsWith('.'))) {
-            return true;
-        }
+        const hasDot = pathParts.some(part => {
+            if (!part.startsWith('.')) return false;
+            // Allow non-directory dotfiles (like .eslintrc.js, .env.example)
+            // and well-known dot-directories (like .github/, .circleci/).
+            if (part === pathParts[pathParts.length - 1]) {
+                // It's the last segment (could be a file or directory).
+                // Allow dot-files (but dot-directories need whitelist).
+                const ext = part.includes('.', 1); // has extension after the dot?
+                if (ext) return false; // dot-file like .eslintrc.js → allow
+            }
+            // It's a directory segment → only allow whitelisted ones.
+            return !FileSynchronizer.ALLOWED_DOT_DIRS.has(part);
+        });
+        if (hasDot) return true;
 
         if (this.ignorePatterns.length === 0) {
             return false;
@@ -252,6 +271,7 @@ export class FileSynchronizer {
 
             this.fileHashes = newFileHashes;
             this.merkleDAG = newMerkleDAG;
+            this.dirty = true; // mark dirty — caller must call markClean() after successful indexing
             await this.saveSnapshot();
 
             console.log(`[Synchronizer] Found changes: ${fileChanges.added.length} added, ${fileChanges.removed.length} removed, ${fileChanges.modified.length} modified.`);
@@ -292,6 +312,19 @@ export class FileSynchronizer {
         return this.fileHashes.get(filePath);
     }
 
+    /** Mark the snapshot as clean after successful indexing. */
+    async markClean(): Promise<void> {
+        if (!this.dirty) return;
+        this.dirty = false;
+        await this.saveSnapshot();
+        console.log('[Synchronizer] Marked snapshot as clean — indexing completed successfully.');
+    }
+
+    /** Returns true if the snapshot is in a dirty (in-progress) state. */
+    isDirty(): boolean {
+        return this.dirty;
+    }
+
     private async saveSnapshot(): Promise<void> {
         const merkleDir = path.dirname(this.snapshotPath);
         await fs.mkdir(merkleDir, { recursive: true });
@@ -305,16 +338,28 @@ export class FileSynchronizer {
 
         const data = JSON.stringify({
             fileHashes: fileHashesArray,
-            merkleDAG: this.merkleDAG.serialize()
+            merkleDAG: this.merkleDAG.serialize(),
+            status: this.dirty ? 'dirty' : 'clean',
         });
         await fs.writeFile(this.snapshotPath, data, 'utf-8');
-        console.log(`Saved snapshot to ${this.snapshotPath}`);
+        console.log(`Saved snapshot to ${this.snapshotPath} (status: ${this.dirty ? 'dirty' : 'clean'})`);
     }
 
     private async loadSnapshot(): Promise<void> {
         try {
             const data = await fs.readFile(this.snapshotPath, 'utf-8');
             const obj = JSON.parse(data);
+
+            // Dirty snapshot → previous indexing was interrupted.
+            // Reset to empty so the next sync treats all files as "added"
+            // instead of falsely reporting "up-to-date".
+            if (obj.status === 'dirty') {
+                console.warn(`[Synchronizer] Snapshot is dirty (previous indexing interrupted). Resetting to empty state.`);
+                this.fileHashes = new Map();
+                this.merkleDAG = new MerkleDAG();
+                this.dirty = true;
+                return;
+            }
 
             // Reconstruct Map without using constructor with iterator
             this.fileHashes = new Map();
@@ -328,16 +373,14 @@ export class FileSynchronizer {
             console.log(`Loaded snapshot from ${this.snapshotPath}`);
         } catch (error: any) {
             if (error.code === 'ENOENT') {
-                // Snapshot missing — start with empty state. Do NOT call
-                // generateFileHashes() here: it reads + SHA256-hashes every
-                // file in the project (9000+ for pytorch), which can crash
-                // the process on large repos. The full index is about to run
-                // anyway; the next incremental sync will detect all files as
-                // "added" and rebuild the merkle tree correctly.
+                // Snapshot missing — start with empty state. Do NOT save
+                // an empty snapshot here (creates a "ghost up-to-date" bug).
+                // The dirty flag will be set by checkForChanges and cleared
+                // by markClean after successful indexing.
                 console.log(`Snapshot file not found at ${this.snapshotPath}. Starting with empty state.`);
                 this.fileHashes = new Map();
                 this.merkleDAG = new MerkleDAG();
-                await this.saveSnapshot();
+                this.dirty = true;
             } else {
                 throw error;
             }

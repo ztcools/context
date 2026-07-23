@@ -254,6 +254,16 @@ Use natural-language queries describing intent (e.g. "how are auth tokens refres
         this.syncManager.startBackgroundSync();
         console.log('[SYNC-DEBUG] MCP server initialization complete');
     }
+
+    /** Gracefully shut down: stop sync, release locks, close graph store. */
+    shutdown(): void {
+        console.error('[SHUTDOWN] Stopping background sync...');
+        try { this.syncManager.stopBackgroundSync(); } catch { /* best effort */ }
+        try { this.syncManager.stopTriggerWatcher(); } catch { /* best effort */ }
+        console.error('[SHUTDOWN] Closing graph store...');
+        try { this.graphToolHandlers.close(); } catch { /* best effort */ }
+        console.error('[SHUTDOWN] Shutdown complete.');
+    }
 }
 
 // Main execution
@@ -273,21 +283,26 @@ async function main() {
 
     const server = new ContextMcpServer(config);
     await server.start();
+    return server;
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', () => {
-    console.error("Received SIGINT, shutting down gracefully...");
-    process.exit(0);
-});
+// Reference to the running server for graceful shutdown.
+let runningServer: ContextMcpServer | null = null;
 
-process.on('SIGTERM', () => {
-    console.error("Received SIGTERM, shutting down gracefully...");
+// Handle graceful shutdown
+function gracefulShutdown(signal: string) {
+    console.error(`Received ${signal}, shutting down gracefully...`);
+    if (runningServer) {
+        try { runningServer.shutdown(); } catch { /* best effort */ }
+    }
     process.exit(0);
-});
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Always start the server - this is designed to be the main entry point
-main().catch((error) => {
+main().then(server => { runningServer = server; }).catch((error) => {
     console.error("Fatal error:", error);
     process.exit(1);
 });

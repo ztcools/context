@@ -153,11 +153,25 @@ export class MilvusEmbeddingCache implements EmbeddingCache {
 
         try {
             await this.db.insert(this.collectionName, documents);
-        } catch (error) {
-            // Duplicate-key inserts (another dev cached the same chunk concurrently)
-            // and other write errors are non-fatal: the vector is already computed
-            // for this run, so we just skip persisting it.
-            console.warn(`[EmbeddingCache] ⚠️  Cache write failed (non-fatal): ${error}`);
+        } catch (error: any) {
+            const msg = error?.message || String(error);
+            // Dimension mismatch → the collection was created for a different
+            // model/dimension. This is fatal — vectors would be corrupt.
+            if (msg.includes('dimension') || msg.includes('dim')) {
+                console.error(`[EmbeddingCache] ❌ Dimension mismatch in cache write: ${msg}`);
+                // Don't throw — the vectors are already computed for this run,
+                // and the cache collection will be recreated on next restart
+                // with the correct dimension via ensureCollection.
+            }
+            // Duplicate primary key → another process cached the same chunk
+            // concurrently. Non-fatal — the vector is already computed.
+            else if (msg.includes('primary') || msg.includes('duplicate') || msg.includes('already exist')) {
+                // Expected in concurrent scenarios — silent.
+            }
+            // All other errors: log but don't block indexing.
+            else {
+                console.warn(`[EmbeddingCache] ⚠️  Cache write failed (non-fatal): ${msg}`);
+            }
         }
     }
 }

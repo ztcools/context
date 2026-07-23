@@ -889,29 +889,24 @@ export class ToolHandlers {
             let searchResults: Awaited<ReturnType<typeof this.context.searchWithLayers>>;
             let searchSourceNote = '';
 
+            // Build the layer chain. Dev collection is always primary (full
+            // working-tree snapshot). Root collection is secondary — it
+            // supplements files the developer hasn't touched, and RRF + dedup
+            // naturally resolve overlaps (dev wins on identical content, root
+            // fills gaps). No mask needed: the global RRF ranks across layers,
+            // and deduplicateResults drops overlapping line ranges.
+            const layers: Array<{ collectionName: string; mask?: string[] }> = [];
+
             if (devExists) {
-                // Dev has indexed → use dev collection (complete working-tree snapshot).
-                searchResults = await this.context.searchWithLayers(
-                    [{ collectionName: devCollectionName }],
-                    query,
-                    Math.min(resultLimit, 50),
-                    tuning.threshold,
-                    filterExpr,
-                );
-                searchSourceNote = ' (dev index)';
-                console.log(`[SEARCH] ✅ Dev-aware search on dev collection '${devCollectionName}'`);
-            } else if (rootExists) {
-                // Dev hasn't indexed → fall back to shared root.
-                searchResults = await this.context.searchWithLayers(
-                    [{ collectionName: rootCollectionName }],
-                    query,
-                    Math.min(resultLimit, 50),
-                    tuning.threshold,
-                    filterExpr,
-                );
-                searchSourceNote = ' (root fallback — run index for your dev copy)';
-                console.log(`[SEARCH] ⚠️  No dev collection, falling back to root '${rootCollectionName}'`);
-            } else {
+                layers.push({ collectionName: devCollectionName });
+            }
+            if (rootExists) {
+                // Only add root if we have dev (two-layer) or as sole fallback.
+                // When both exist, root supplements files not in dev.
+                layers.push({ collectionName: rootCollectionName });
+            }
+
+            if (layers.length === 0) {
                 return {
                     content: [{
                         type: "text",
@@ -919,6 +914,25 @@ export class ToolHandlers {
                     }],
                     isError: true
                 };
+            }
+
+            searchResults = await this.context.searchWithLayers(
+                layers,
+                query,
+                Math.min(resultLimit, 50),
+                tuning.threshold,
+                filterExpr,
+            );
+
+            if (layers.length > 1) {
+                searchSourceNote = ' (dev ⊕ root)';
+                console.log(`[SEARCH] ✅ Two-layer search: dev '${devCollectionName}' ⊕ root '${rootCollectionName}'`);
+            } else if (devExists) {
+                searchSourceNote = ' (dev index)';
+                console.log(`[SEARCH] ✅ Dev-only search on '${devCollectionName}'`);
+            } else {
+                searchSourceNote = ' (root fallback — run index for your dev copy)';
+                console.log(`[SEARCH] ⚠️  Root-only search on '${rootCollectionName}'`);
             }
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
@@ -960,33 +974,16 @@ export class ToolHandlers {
                 };
             }
 
-            // Dedup overlapping/duplicate snippets from the same file. Vector
-            // chunking can surface several chunks covering the same lines; since
-            // results are already rank-ordered (best first), drop any later
-            // result whose line range intersects an already-kept range in the
-            // same file. This keeps the result budget on diverse code instead of
-            // repeats — higher signal density when replacing manual file reads.
-            const dedupedResults: any[] = [];
-            for (const r of searchResults) {
-                const overlaps = dedupedResults.some((k: any) =>
-                    k.relativePath === r.relativePath &&
-                    r.startLine <= k.endLine && r.endLine >= k.startLine
-                );
-                if (!overlaps) dedupedResults.push(r);
-            }
-
             // Relative-score tail cutoff. Results are rank-ordered (best first),
             // so once a result scores below ratio×topScore it's a weak match that
-            // mostly wastes tokens. This is relative, so it works in both the
-            // dense path and the hybrid/RRF path (where the absolute `threshold`
-            // above is ignored). Disabled when SEARCH_SCORE_RATIO=0. Always keeps
-            // at least the top result.
-            let scoredResults = dedupedResults;
-            if (tuning.scoreRatio > 0 && dedupedResults.length > 1) {
-                const topScore = Number(dedupedResults[0]?.score) || 0;
+            // mostly wastes tokens. Dedup is already handled by searchWithLayers
+            // (>50% overlap threshold) — no second pass needed here.
+            let scoredResults = searchResults;
+            if (tuning.scoreRatio > 0 && scoredResults.length > 1) {
+                const topScore = Number(scoredResults[0]?.score) || 0;
                 if (topScore > 0) {
                     const floor = topScore * tuning.scoreRatio;
-                    scoredResults = dedupedResults.filter((r: any, i: number) =>
+                    scoredResults = scoredResults.filter((r: any, i: number) =>
                         i === 0 || (Number(r.score) || 0) >= floor
                     );
                 }

@@ -29,11 +29,15 @@ let _cached: string | null = null;
 
 /** Normalize an arbitrary string into a short, safe identifier segment. */
 function slugify(raw: string, maxLen: number = 12): string {
-    return raw
+    const slug = raw
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .replace(/^_+|_+$/g, '')
         .slice(0, maxLen);
+    // Append a 4-char hash to prevent collisions (e.g. alice.johnson@c.com
+    // and alice.johnson-smith@c.com both slugify to "alice_johnso").
+    const hash = crypto.createHash('md5').update(raw).digest('hex').substring(0, 4);
+    return `${slug}_${hash}`;
 }
 
 /** Compute a fresh fingerprint from the resolution priority chain. */
