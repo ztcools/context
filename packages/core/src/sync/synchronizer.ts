@@ -67,10 +67,19 @@ export class FileSynchronizer {
     }
 
     private async hashFile(filePath: string): Promise<string> {
-        // Double-check that this is actually a file, not a directory
         const stat = await fs.stat(filePath);
         if (stat.isDirectory()) {
             throw new Error(`Attempted to hash a directory: ${filePath}`);
+        }
+        // Stream large files (> 10MB) to avoid OOM.
+        if (stat.size > 10 * 1024 * 1024) {
+            return new Promise<string>((resolve, reject) => {
+                const hash = crypto.createHash('sha256');
+                const stream = fsSync.createReadStream(filePath);
+                stream.on('data', (chunk: string | Buffer) => hash.update(chunk));
+                stream.on('end', () => resolve(hash.digest('hex')));
+                stream.on('error', reject);
+            });
         }
         const content = await fs.readFile(filePath, 'utf-8');
         return crypto.createHash('sha256').update(content).digest('hex');
@@ -79,19 +88,22 @@ export class FileSynchronizer {
     private async generateFileHashes(dir: string): Promise<Map<string, string>> {
         const fileHashes = new Map<string, string>();
 
-        // Try git ls-files first — respects .gitignore and is much faster
+        // Try git ls-files first — respects .gitignore and is much faster.
+        // Filter in JS to avoid command-line length limits with many extensions.
         let files: string[] = [];
         try {
             if (this.supportedExtensions.length === 0) {
                 return fileHashes;
             }
-            const extPatterns = this.supportedExtensions.map((e) => `"*${e}"`).join(' ');
-            const namePatterns = this.supportedFilenames.map((n) => `"*${n}"`).join(' ');
+            const extSet = new Set(this.supportedExtensions);
+            const nameSet = new Set(this.supportedFilenames);
             const output = execSync(
-                `git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns} ${namePatterns}`,
+                `git -C "${dir}" ls-files --cached --others --exclude-standard`,
                 { encoding: 'utf-8', timeout: 10_000, maxBuffer: 10 * 1024 * 1024 }
             );
-            files = output.trim().split('\n').filter(Boolean).map(f => path.join(dir, f));
+            files = output.trim().split('\n').filter(Boolean)
+                .filter(f => extSet.has(path.extname(f)) || nameSet.has(path.basename(f)))
+                .map(f => path.join(dir, f));
         } catch {
             // Fallback: filesystem walk
             return await this.generateFileHashesFromFS(dir);
@@ -228,21 +240,15 @@ export class FileSynchronizer {
 
     private buildMerkleDAG(fileHashes: Map<string, string>): MerkleDAG {
         const dag = new MerkleDAG();
-        const keys = Array.from(fileHashes.keys());
-        const sortedPaths = keys.slice().sort(); // Create a sorted copy
+        const sortedPaths = Array.from(fileHashes.keys()).slice().sort();
 
-        // Create a root node for the entire directory
-        let valuesString = "";
-        keys.forEach(key => {
-            valuesString += fileHashes.get(key);
-        });
-        const rootNodeData = "root:" + valuesString;
-        const rootNodeId = dag.addNode(rootNodeData);
+        // Root hash = hash of all (path, fileHash) pairs — compact representation.
+        const rootData = sortedPaths.map(p => `${p}:${fileHashes.get(p)}`).join(',');
+        const rootNodeId = dag.addNode(`root:${rootData}`);
 
-        // Add each file as a child of the root
+        // Add each file as a leaf child of the root.
         for (const path of sortedPaths) {
-            const fileData = path + ":" + fileHashes.get(path);
-            dag.addNode(fileData, rootNodeId);
+            dag.addNode(`${path}:${fileHashes.get(path)}`, rootNodeId);
         }
 
         return dag;

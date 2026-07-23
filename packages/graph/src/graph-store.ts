@@ -92,6 +92,8 @@ END;
 
 export class SqliteGraphStore implements GraphStore {
     private db: Database.Database;
+    /** Readonly connection for search operations — avoids blocking writes during graph builds. */
+    private dbRO: Database.Database | null = null;
     private dbPath: string;
     /** Cached prepared statements to avoid re-compiling SQL on every call. */
     private upsertNodeStmt!: Database.Statement;
@@ -183,6 +185,23 @@ export class SqliteGraphStore implements GraphStore {
         if (this.db) {
             this.db.close();
         }
+        if (this.dbRO) {
+            this.dbRO.close();
+            this.dbRO = null;
+        }
+    }
+
+    /**
+     * Get a readonly connection for search operations. In WAL mode, SQLite
+     * supports concurrent readers while a writer is active. Search handlers
+     * should use this to avoid blocking on graph index builds.
+     */
+    getReadonlyDB(): Database.Database {
+        if (!this.dbRO) {
+            this.dbRO = new Database(this.dbPath, { readonly: true });
+            this.dbRO.pragma('journal_mode = WAL');
+        }
+        return this.dbRO;
     }
 
     /** Flush the WAL to the main database file and release space. */

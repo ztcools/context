@@ -38,6 +38,10 @@ export class ToolHandlers {
      * searches skip it. Cleared naturally on server restart.
      */
     private architectureEmitted: Set<string> = new Set();
+    /** LRU cache for search query embeddings to avoid re-embedding frequent queries. */
+    private queryEmbeddingCache: Map<string, { vector: number[]; ts: number }> = new Map();
+    private static readonly QUERY_CACHE_MAX = 64;
+    private static readonly QUERY_CACHE_TTL_MS = 5 * 60 * 1000;
 
     constructor(context: Context, snapshotManager: SnapshotManager, graphToolHandlers?: GraphToolHandlers) {
         this.context = context;
@@ -93,12 +97,10 @@ export class ToolHandlers {
                 console.warn(`[SNAPSHOT-RECOVERY] Collection '${collectionName}' truly empty — NOT writing recovered entry (would poison client)`);
                 return null;
             }
-            // rowCount is chunk count, not file count (typically 10-100x larger).
-            // Without a metadata query we don't have the real file count;
-            // the snapshot will be corrected on the next full index.
-            // Using rowCount for both is imprecise but keeps the state
-            // non-zero so the client doesn't misread it as empty.
-            return { indexedFiles: rowCount, totalChunks: rowCount };
+            // rowCount is chunk count, not file count. IndexedFiles is marked -1
+            // to signal "unknown" — corrected on the next full index. TotalChunks
+            // gets the real rowCount to distinguish empty vs non-empty collections.
+            return { indexedFiles: -1, totalChunks: rowCount };
         } catch (error) {
             console.warn(`[SNAPSHOT-RECOVERY] Failed to query stats for '${codebasePath}':`, error);
             return null;

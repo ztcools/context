@@ -9,7 +9,7 @@ import { createRequestSplitter, resolveRequestSplitterType } from "./splitter.js
 const DEFAULT_INITIAL_SYNC_DELAY_MS = 5_000;
 const DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_SYNC_INTERVAL_MS = 1_000;
-const DEFAULT_SYNC_LOCK_STALE_MS = 10 * 60 * 1000;
+const DEFAULT_SYNC_LOCK_STALE_MS = 2 * 60 * 1000; // 2 minutes
 const SYNC_LOCK_STALE_ENV = "CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS";
 
 function isBackgroundSyncEnabled(): boolean {

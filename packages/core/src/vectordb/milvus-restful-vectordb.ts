@@ -508,6 +508,57 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         }
     }
 
+    async sparseSearch(collectionName: string, queryText: string, options?: SearchOptions): Promise<VectorSearchResult[]> {
+        await this.ensureInitialized();
+        await this.ensureLoaded(collectionName);
+
+        const topK = options?.topK || 10;
+
+        try {
+            const restfulConfig = this.config as MilvusRestfulConfig;
+            const searchRequest: any = {
+                collectionName,
+                dbName: restfulConfig.database,
+                data: [queryText],
+                annsField: 'sparse_vector',
+                limit: topK,
+                outputFields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
+                searchParams: {
+                    metricType: 'BM25',
+                    params: { drop_ratio_search: 0.2 },
+                },
+            };
+
+            if (options?.filterExpr && options.filterExpr.trim().length > 0) {
+                searchRequest.filter = options.filterExpr;
+            }
+
+            const response = await this.makeRequest('/entities/search', 'POST', searchRequest);
+
+            const results: VectorSearchResult[] = (response.data || []).map((item: any) => {
+                let metadata = {};
+                try { metadata = JSON.parse(item.metadata || '{}'); } catch { metadata = {}; }
+                return {
+                    document: {
+                        id: item.id?.toString() || '',
+                        vector: [],
+                        content: item.content || '',
+                        relativePath: item.relativePath || '',
+                        startLine: item.startLine || 0,
+                        endLine: item.endLine || 0,
+                        fileExtension: item.fileExtension || '',
+                        metadata,
+                    },
+                    score: item.distance || item.score || 0,
+                };
+            });
+            return results;
+        } catch (error) {
+            console.error(`[MilvusRestfulDB] ❌ Failed to sparseSearch in collection '${collectionName}':`, error);
+            throw error;
+        }
+    }
+
     async query(collectionName: string, filter?: string, outputFields?: string[], limit?: number): Promise<Record<string, any>[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);

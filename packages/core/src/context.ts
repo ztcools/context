@@ -1263,15 +1263,8 @@ export class Context {
             console.log(`[Context] 🔄 Merkle changes: +${added.length}/~${modified.length}/-${removed.length}`);
         }
 
-        // Delete chunks for removed + modified files.
-        for (const file of removed) {
-            if (signal?.aborted) break;
-            await this.deleteFileChunks(devCollectionName, file);
-        }
-        for (const file of modified) {
-            if (signal?.aborted) break;
-            await this.deleteFileChunks(devCollectionName, file);
-        }
+        // Delete chunks for removed + modified files (batch query + batch delete).
+        await this.deleteFileChunksBatch(devCollectionName, [...removed, ...modified], signal);
 
         // Index added + modified files.
         const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
@@ -1365,6 +1358,34 @@ export class Context {
         }
     }
 
+    /** Batch delete chunks for many files — single query + single delete for efficiency. */
+    private async deleteFileChunksBatch(collectionName: string, files: string[], signal?: AbortSignal): Promise<void> {
+        if (files.length === 0) return;
+        const escaped = files.map(f => `"${f.replace(/\\/g, '\\\\')}"`).join(', ');
+        try {
+            const results = await this.vectorDatabase.query(
+                collectionName,
+                `relativePath in [${escaped}]`,
+                ['id'],
+                16384,
+            );
+            if (results.length > 0) {
+                const ids = results.map(r => r.id as string).filter(id => id);
+                if (ids.length > 0) {
+                    await this.vectorDatabase.delete(collectionName, ids);
+                    console.log(`[Context] Batch deleted ${ids.length} chunks for ${files.length} files`);
+                }
+            }
+        } catch (error: any) {
+            // Fall back to per-file delete on batch failure.
+            console.warn(`[Context] Batch delete failed, falling back to per-file: ${error.message}`);
+            for (const file of files) {
+                if (signal?.aborted) break;
+                await this.deleteFileChunks(collectionName, file);
+            }
+        }
+    }
+
     /**
      * Semantic search with unified implementation
      * @param codebasePath Codebase path to search in
@@ -1405,8 +1426,8 @@ export class Context {
         // BM25 scores aren't comparable across collections). This is more accurate
         // than letting each layer RRF-fuse itself and then merging fused scores.
         if (isHybrid && activeLayers.length > 1 && typeof this.vectorDatabase.sparseSearch === 'function') {
-            const fused = await this.globalHybridFusion(activeLayers, queryEmbedding.vector, query, topK, filterExpr);
-            console.log(`[Context] ✅ Global-RRF ${searchType} over ${activeLayers.length} layers → ${fused.length} results`);
+            const fused = await this.globalHybridFusion(activeLayers, queryEmbedding.vector, query, topK, filterExpr, threshold);
+            console.log(`[Context] ✅ Global-RRF search over ${activeLayers.length} layers → ${fused.length} results`);
             return fused;
         }
 
@@ -1431,7 +1452,8 @@ export class Context {
         all.sort((a, b) => b.score - a.score);
         const deduped = this.deduplicateResults(all);
         deduped.sort((a, b) => b.score - a.score);
-        const finalResults = deduped.slice(0, topK);
+        const filtered = this.applyScoreCutoff(deduped, threshold);
+        const finalResults = filtered.slice(0, topK);
         console.log(`[Context] ✅ Layered ${searchType} over ${activeLayers.length} layer(s): ${all.length} raw → ${finalResults.length} results`);
         return finalResults;
     }
@@ -1490,9 +1512,10 @@ export class Context {
         queryText: string,
         topK: number,
         filterExpr?: string,
+        threshold: number = 0,
     ): Promise<SemanticSearchResult[]> {
         const sparseSearch = this.vectorDatabase.sparseSearch!.bind(this.vectorDatabase);
-        const RRF_K = 100;
+        const RRF_K = parseInt(envManager.get('RRF_K') || '100', 10) || 100;
 
         const perLayer = await Promise.all(activeLayers.map(async layer => {
             const f = this.combineFilters(filterExpr, this.buildMaskFilter(layer.mask));
@@ -1544,7 +1567,10 @@ export class Context {
         scored.sort((a, b) => b.score - a.score);
         const deduped = this.deduplicateResults(scored);
         deduped.sort((a, b) => b.score - a.score);
-        return deduped.slice(0, topK);
+        // Apply score cutoff (RRF scores are in ~0.001-0.01 range;
+        // threshold is treated as a relative ratio against the top score).
+        const filtered = this.applyScoreCutoff(deduped, threshold);
+        return filtered.slice(0, topK);
     }
 
     /** Build a `relativePath not in [...]` expression to mask base-layer files. */
@@ -1560,6 +1586,22 @@ export class Context {
         if (parts.length === 0) return undefined;
         if (parts.length === 1) return parts[0];
         return parts.map(p => `(${p})`).join(' and ');
+    }
+
+    /**
+     * Apply a score cutoff to ranked results. In dense (cosine) mode the
+     * threshold is an absolute minimum score. In hybrid/RRF mode the scores
+     * are small reciprocal-rank values — the threshold is treated as a
+     * relative ratio against the top score (0 disables filtering).
+     */
+    private applyScoreCutoff(results: SemanticSearchResult[], threshold: number): SemanticSearchResult[] {
+        if (threshold <= 0 || results.length <= 1) return results;
+        const top = results[0].score;
+        if (top <= 0) return results;
+        // RRF scores are ~0.001-0.01; cosine scores are 0-1. Use relative cutoff
+        // in all modes so the same threshold value works consistently.
+        const floor = top * threshold;
+        return results.filter(r => r.score >= floor);
     }
 
     /**
@@ -1780,16 +1822,18 @@ export class Context {
     ): Promise<string[]> {
         const files: string[] = [];
 
-        // Try git ls-files first — respects .gitignore and is much faster
+        // Try git ls-files first — respects .gitignore and is much faster.
+        // Filter in JS to avoid command-line length limits with many extensions.
         try {
-            const extPatterns = supportedExtensions.map((e) => `"*${e}"`).join(' ');
-            const namePatterns = this.supportedFilenames.map((n) => `"*${n}"`).join(' ');
-            const output = execSync(`git -C "${codebasePath}" ls-files --cached --others --exclude-standard -- ${extPatterns} ${namePatterns}`, {
+            const extSet = new Set(supportedExtensions);
+            const nameSet = new Set(this.supportedFilenames);
+            const output = execSync(`git -C "${codebasePath}" ls-files --cached --others --exclude-standard`, {
                 encoding: 'utf-8',
                 timeout: 10_000,
                 maxBuffer: 10 * 1024 * 1024,
             });
-            const lines = output.trim().split('\n').filter(Boolean);
+            const lines = output.trim().split('\n').filter(Boolean)
+                .filter(f => extSet.has(path.extname(f)) || nameSet.has(path.basename(f)));
             for (const line of lines) {
                 const fullPath = path.join(codebasePath, line);
                 if (fs.existsSync(fullPath)) {
@@ -1844,10 +1888,12 @@ export class Context {
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
-        const CHUNK_LIMIT = 450000;
+        const CHUNK_LIMIT = Math.max(1, parseInt(envManager.get('INDEX_CHUNK_LIMIT') || '450000', 10));
         console.log(`[Context] 🔧 Using EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE}`);
 
         let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];
+        /** Chunks that failed to embed and will be retried at the end. */
+        let retryBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];
         let processedFiles = 0;
         let totalChunks = 0;
         let limitReached = false;
@@ -1881,23 +1927,25 @@ export class Context {
 
                     // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
+                        // Check abort before each batch (not just at file boundaries).
+                        if (signal?.aborted) {
+                            throw new IndexAbortError(`Indexing aborted at chunk ${totalChunks}`);
+                        }
                         try {
                             await this.processChunkBuffer(chunkBuffer, signal, collectionNameOverride);
                             chunkBuffer = []; // Clear on success
                         } catch (error) {
-                            // Embedding errors (such as API having no quota) halt the entire indexing process and propagate upwards.
                             if (error instanceof EmbeddingError) {
                                 throw error;
                             }
                             const searchType = isHybrid === true ? 'hybrid' : 'regular';
                             console.error(`[Context] ❌ Failed to process chunk batch for ${searchType}:`, error);
-                            if (error instanceof Error) {
-                                console.error('[Context] Stack trace:', error.stack);
-                            }
+                            // Move failed chunks to retry buffer instead of discarding.
                             if (chunkBuffer.length > 0) {
-                                console.warn(`[Context] Discarding ${chunkBuffer.length} chunks due to batch processing failure`);
+                                console.warn(`[Context] Scheduling ${chunkBuffer.length} chunks for retry`);
+                                retryBuffer.push(...chunkBuffer);
                             }
-                            chunkBuffer = []; // Clear buffer on failure
+                            chunkBuffer = [];
                         }
                     }
 
@@ -1931,13 +1979,20 @@ export class Context {
             try {
                 await this.processChunkBuffer(chunkBuffer, signal, collectionNameOverride);
             } catch (error) {
-                if (error instanceof EmbeddingError) {
-                    throw error;
-                }
-                console.error(`[Context] ❌ Failed to process final chunk batch for ${searchType}:`, error);
-                if (error instanceof Error) {
-                    console.error('[Context] Stack trace:', error.stack);
-                }
+                if (error instanceof EmbeddingError) { throw error; }
+                retryBuffer.push(...chunkBuffer);
+                console.error(`[Context] ❌ Failed final batch; ${chunkBuffer.length} chunks queued for retry`);
+            }
+        }
+
+        // Retry failed chunks once (non-fatal: log failures but don't stop).
+        if (retryBuffer.length > 0 && !signal?.aborted) {
+            console.warn(`[Context] 🔄 Retrying ${retryBuffer.length} previously failed chunks...`);
+            try {
+                await this.processChunkBuffer(retryBuffer, signal, collectionNameOverride);
+            } catch (error: any) {
+                if (error instanceof EmbeddingError) { throw error; }
+                console.warn(`[Context] ⚠️  ${retryBuffer.length} chunks could not be indexed after retry — these files may have incomplete search coverage. Next Merkle sync will retry. Error: ${error.message}`);
             }
         }
 
@@ -2008,14 +2063,34 @@ export class Context {
 
         if (missIndices.length > 0) {
             const missContents = missIndices.map(i => chunks[i].content);
-            let missEmbeddings: EmbeddingVector[];
-            try {
-                missEmbeddings = await this.embedding.embedBatch(missContents);
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                // Include batch size in the log/error message so operators can
-                // identify how many chunks were lost when the API call failed.
-                console.error(`[Context] ❌ Embedding API failed (batch size: ${missContents.length}): ${errorMessage}`);
+            let missEmbeddings: EmbeddingVector[] = [];
+            // Exponential backoff retry for embedding API (transient errors only).
+            const RETRY_MAX = 3;
+            const RETRY_BASE_MS = 500;
+            let lastError: Error | null = null;
+            let success = false;
+            for (let attempt = 0; attempt < RETRY_MAX; attempt++) {
+                try {
+                    if (attempt > 0) {
+                        const delay = RETRY_BASE_MS * Math.pow(2, attempt - 1);
+                        console.warn(`[Context] 🔄 Embedding API retry ${attempt}/${RETRY_MAX - 1} after ${delay}ms...`);
+                        await new Promise(r => setTimeout(r, delay));
+                    }
+                    missEmbeddings = await this.embedding.embedBatch(missContents);
+                    success = true;
+                    break;
+                } catch (error: any) {
+                    lastError = error;
+                    const msg = error?.message || String(error);
+                    // Fatal errors (auth, quota) should not be retried.
+                    if (msg.includes('401') || msg.includes('403') || msg.includes('quota') ||
+                        msg.includes('invalid') || msg.includes('Unauthorized')) {
+                        break;
+                    }
+                }
+            }
+            if (!success) {
+                const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
                 throw new EmbeddingError(`Embedding API error (batch size: ${missContents.length}): ${errorMessage}`);
             }
             this.validateEmbeddings(missEmbeddings, missIndices.length);
@@ -2561,7 +2636,7 @@ export class Context {
                 collectionName: l.collectionName,
                 mask: l.mask || [],
             }));
-            const fused = await this.globalHybridFusion(layerObjs, queryEmbedding.vector, query, topK, filterExpr);
+            const fused = await this.globalHybridFusion(layerObjs, queryEmbedding.vector, query, topK, filterExpr, threshold);
             console.log(`[Context] ✅ Dev-aware RRF → ${fused.length} results`);
             return fused;
         }
@@ -2584,7 +2659,8 @@ export class Context {
         all.sort((a, b) => b.score - a.score);
         const deduped = this.deduplicateResults(all);
         deduped.sort((a, b) => b.score - a.score);
-        const finalResults = deduped.slice(0, topK);
+        const filtered = this.applyScoreCutoff(deduped, threshold);
+        const finalResults = filtered.slice(0, topK);
         console.log(`[Context] ✅ Dev-aware search: ${all.length} raw → ${finalResults.length} results`);
         return finalResults;
     }
