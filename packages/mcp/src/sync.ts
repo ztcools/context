@@ -208,11 +208,11 @@ export class SyncManager {
                 }
 
                 try {
-                    console.log(`[SYNC-DEBUG] Calling context.reindexByChange() for '${codebasePath}'`);
+                    console.log(`[SYNC-DEBUG] Calling context.syncIndexByMerkle() for '${codebasePath}'`);
                     const requestSplitterType: RequestSplitterType = resolveRequestSplitterType(codebaseInfo?.requestSplitter);
                     const requestIgnorePatterns = codebaseInfo?.requestIgnorePatterns || [];
                     const requestCustomExtensions = codebaseInfo?.requestCustomExtensions || [];
-                    const stats = await this.context.reindexByChange(
+                    const stats = await this.context.syncIndexByMerkle(
                         codebasePath,
                         undefined,
                         requestIgnorePatterns,

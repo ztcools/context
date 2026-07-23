@@ -15,3 +15,9 @@ export {
     diffChangedFiles,
     ChangedFiles,
 } from './git-history';
+export {
+    getDevFingerprint,
+    clearDevFingerprintCache,
+    getDevRepoIdentity,
+    getBranchIdentity,
+} from './dev-fingerprint';

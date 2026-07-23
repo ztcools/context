@@ -16,9 +16,18 @@ export class FileSynchronizer {
     private ignorePatterns: string[];
     private supportedExtensions: string[];
     private supportedFilenames: string[];
+    /** Explicit identity override for dev-aware snapshots (url:branch:devId). */
+    private identityOverride?: string;
 
-    constructor(rootDir: string, ignorePatterns: string[] = [], supportedExtensions: string[] = [], supportedFilenames: string[] = []) {
+    constructor(
+        rootDir: string,
+        ignorePatterns: string[] = [],
+        supportedExtensions: string[] = [],
+        supportedFilenames: string[] = [],
+        identityOverride?: string,
+    ) {
         this.rootDir = rootDir;
+        this.identityOverride = identityOverride;
         this.snapshotPath = this.getSnapshotPath(rootDir);
         this.fileHashes = new Map();
         this.merkleDAG = new MerkleDAG();
@@ -38,7 +47,13 @@ export class FileSynchronizer {
         const merkleDir = path.join(homeDir, '.context', 'merkle');
         let identity: string;
         try {
-            identity = getRepoIdentity(codebasePath);
+            // Use explicit identity override if provided (dev-aware),
+            // otherwise fall back to auto-detected repo identity.
+            if (this.identityOverride) {
+                identity = this.identityOverride;
+            } else {
+                identity = getRepoIdentity(codebasePath);
+            }
         } catch {
             // Fallback to path-based identity if git is not available
             const hash = crypto.createHash('md5').update(codebasePath).digest('hex');
@@ -330,12 +345,19 @@ export class FileSynchronizer {
     }
 
     /**
-     * Delete snapshot file for a given codebase path
+     * Delete snapshot file for a given codebase path.
+     * @param codebasePath Path to the codebase
+     * @param identityOverride Optional dev-aware identity for the snapshot file
      */
-    static async deleteSnapshot(codebasePath: string): Promise<void> {
+    static async deleteSnapshot(codebasePath: string, identityOverride?: string): Promise<void> {
         const homeDir = os.homedir();
         const merkleDir = path.join(homeDir, '.context', 'merkle');
-        const identity = getRepoIdentity(codebasePath);
+        let identity: string;
+        if (identityOverride) {
+            identity = identityOverride;
+        } else {
+            identity = getRepoIdentity(codebasePath);
+        }
         const hash = crypto.createHash('md5').update(identity).digest('hex');
         const snapshotPath = path.join(merkleDir, `${hash}.json`);
 

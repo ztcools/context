@@ -1181,6 +1181,199 @@ export class Context {
         return { added: added.length, removed: removed.length, modified: modified.length };
     }
 
+    /**
+     * Merkle-based incremental indexing — the developer-side replacement for
+     * `syncIndexByGit`. Compares the working tree's content hashes against the
+     * last Merkle snapshot (per dev+identity) and indexes only changed files.
+     *
+     * No git commit SHA is used — git reset, rebase, etc. are handled correctly
+     * because we track file content, not commit history.
+     *
+     * Writes to the dev-specific collection (`hcc_repo_branch_dev_hash`),
+     * never touches the shared root collection.
+     */
+    async syncIndexByMerkle(
+        codebasePath: string,
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void | Promise<void>,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter,
+        signal?: AbortSignal,
+    ): Promise<{
+        mode: 'full' | 'incremental' | 'up-to-date';
+        indexedFiles: number;
+        totalChunks: number;
+        added: number;
+        modified: number;
+        removed: number;
+        status: 'completed' | 'limit_reached';
+    }> {
+        const devCollectionName = this.getDevCollectionName(codebasePath);
+        const splitter = requestSplitter || this.codeSplitter;
+        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
+
+        // Dev-aware identity for the Merkle snapshot, so each dev gets their own.
+        const { getDevRepoIdentity } = require('./utils/dev-fingerprint');
+        const devIdentity = getDevRepoIdentity(codebasePath);
+
+        // Ensure collection exists (creates if first time for this dev+branch).
+        await this.prepareDevCollection(codebasePath, devIdentity);
+
+        // Get or create the dev-aware FileSynchronizer.
+        let synchronizer = this.synchronizers.get(devCollectionName);
+        const isFirstIndex = !synchronizer;
+
+        if (!synchronizer) {
+            synchronizer = new FileSynchronizer(
+                codebasePath,
+                ignorePatterns,
+                supportedExtensions,
+                this.supportedFilenames,
+                devIdentity, // dev-aware identity for Merkle snapshot
+            );
+            await synchronizer.initialize();
+            this.synchronizers.set(devCollectionName, synchronizer);
+        }
+
+        progressCallback?.({ phase: 'Checking for file changes (Merkle)...', current: 0, total: 100, percentage: 0 });
+
+        // Merkle comparison: what changed in the working tree?
+        const { added, removed, modified } = await synchronizer.checkForChanges();
+        const totalChanges = added.length + removed.length + modified.length;
+
+        if (totalChanges === 0 && !isFirstIndex) {
+            progressCallback?.({ phase: 'Already up to date', current: 100, total: 100, percentage: 100 });
+            console.log('[Context] ✅ No file changes detected (Merkle). Index is up to date.');
+            return {
+                mode: 'up-to-date',
+                indexedFiles: 0,
+                totalChunks: 0,
+                added: 0,
+                modified: 0,
+                removed: 0,
+                status: 'completed',
+            };
+        }
+
+        // First index: all files are "added"
+        if (isFirstIndex) {
+            console.log('[Context] 🆕 First index for this dev+branch — full Merkle-based index.');
+        } else {
+            console.log(`[Context] 🔄 Merkle changes: +${added.length}/~${modified.length}/-${removed.length}`);
+        }
+
+        // Delete chunks for removed + modified files.
+        for (const file of removed) {
+            if (signal?.aborted) break;
+            await this.deleteFileChunks(devCollectionName, file);
+        }
+        for (const file of modified) {
+            if (signal?.aborted) break;
+            await this.deleteFileChunks(devCollectionName, file);
+        }
+
+        // Index added + modified files.
+        const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
+        let processedFiles = 0;
+        let totalChunks = 0;
+        let limitReached = false;
+
+        if (filesToIndex.length > 0 && !signal?.aborted) {
+            // Temporarily override collection name so processFileList writes to
+            // the dev-specific collection.
+            const originalGetName = this.getCollectionName.bind(this);
+            const devAwareGetName = (p: string) => devCollectionName;
+
+            // We need processFileList to write to devCollectionName.
+            // processFileList calls this.getCollectionName(codebasePath) — but
+            // we want it to return devCollectionName. The cleanest way is to
+            // temporarily swap: override collectionNameOverride then restore.
+            const savedOverride = this.collectionNameOverride;
+            // Use a synthetic override that includes the dev suffix.
+            // getCollectionName will use getCollectionNameForIdentity which
+            // already hashes the full identity. So we need a different approach.
+            //
+            // Actually, the simplest fix: make processFileList accept an optional
+            // collectionName parameter. But that's a bigger refactor.
+            //
+            // Alternative: just use the dev-aware getCollectionName.
+            // getCollectionName calls getRepoIdentityCached which returns
+            // url:branch. We need url:branch:devId.
+            //
+            // Let's temporarily override the identity cache.
+            const origCached = this.getRepoIdentityCached.bind(this);
+            const cachedDevIdentity = devIdentity;
+            // @ts-ignore — temporary override for this indexing pass
+            const patchedGetRepoIdentityCached = (_p: string) => cachedDevIdentity;
+            (this as any).getRepoIdentityCached = patchedGetRepoIdentityCached;
+
+            try {
+                const result = await this.processFileList(
+                    filesToIndex,
+                    codebasePath,
+                    (filePath, fileIndex, totalFiles) => {
+                        const pct = Math.round((fileIndex / totalFiles) * 100);
+                        progressCallback?.({ phase: `Indexing (${fileIndex}/${totalFiles})...`, current: fileIndex, total: totalFiles, percentage: pct });
+                    },
+                    splitter,
+                    signal,
+                );
+                processedFiles = result.processedFiles;
+                totalChunks = result.totalChunks;
+                limitReached = result.status === 'limit_reached';
+            } finally {
+                // Restore original identity cache function.
+                (this as any).getRepoIdentityCached = origCached;
+            }
+        }
+
+        if (isFirstIndex) {
+            // First index is conceptually a "full" for this dev, since we had
+            // no prior snapshot and all files were treated as "added".
+            console.log(`[Context] ✅ Dev-aware first index complete: ${processedFiles} files, ${totalChunks} chunks`);
+        } else {
+            console.log(`[Context] ✅ Dev-aware Merkle sync complete: +${added.length}/~${modified.length}/-${removed.length}, ${processedFiles} files, ${totalChunks} chunks`);
+        }
+
+        return {
+            mode: isFirstIndex ? 'full' : 'incremental',
+            indexedFiles: processedFiles,
+            totalChunks,
+            added: added.length,
+            modified: modified.length,
+            removed: removed.length,
+            status: limitReached ? 'limit_reached' : 'completed',
+        };
+    }
+
+    /**
+     * Ensure the dev-specific collection exists. Creates it if this is the
+     * first time this developer indexes this branch.
+     */
+    private async prepareDevCollection(codebasePath: string, devIdentity: string): Promise<void> {
+        const collectionName = this.getCollectionNameForIdentity(devIdentity);
+        const exists = await this.vectorDatabase.hasCollection(collectionName);
+        if (exists) return;
+
+        const isHybrid = this.getIsHybrid();
+        const collectionType = isHybrid ? 'hybrid vector' : 'vector';
+        console.log(`[Context] 🔧 Creating ${collectionType} collection for dev: ${collectionName}`);
+
+        const dimension = this.embedding.getDimension() || await this.embedding.detectDimension();
+        this.knownDimension = dimension;
+
+        const repoUrl = getRemoteUrl(codebasePath);
+        const description = repoUrl ? `codebasePath:${devIdentity}` : `codebasePath:${devIdentity}`;
+
+        if (isHybrid) {
+            await this.vectorDatabase.createHybridCollection(collectionName, dimension, description);
+        } else {
+            await this.vectorDatabase.createCollection(collectionName, dimension, description);
+        }
+        console.log(`[Context] ✅ Dev collection ${collectionName} created (dim=${dimension})`);
+    }
+
     private async deleteFileChunks(collectionName: string, relativePath: string): Promise<void> {
         // Escape backslashes for Milvus query expression (Windows path compatibility)
         const escapedPath = relativePath.replace(/\\/g, '\\\\');
@@ -2313,5 +2506,104 @@ export class Context {
                 reason: 'Using LangChain splitter directly'
             };
         }
+    }
+
+    // ── Dev-aware indexing (team development) ──────────────────────────
+    // Replaces syncIndexByGit for developer-side MCP: uses Merkle trees
+    // (content hashing) instead of git commit diff. Each developer gets
+    // their own per-branch collection; the embedding cache is shared
+    // globally so repeated content is never re-embedded.
+
+    /**
+     * Collection name for the current developer on the current branch.
+     * Identity = `url:branch:devFingerprint` → `hcc_repo_branch_dev_hash`.
+     */
+    getDevCollectionName(codebasePath: string): string {
+        // Late import avoids circular dependency (dev-fingerprint → git-identity)
+        const { getDevRepoIdentity } = require('./utils/dev-fingerprint');
+        return this.getCollectionNameForIdentity(getDevRepoIdentity(codebasePath));
+    }
+
+    /**
+     * Collection name for the shared root (main/master) branch.
+     * The root is indexed by the server-side git-index-service; the
+     * developer MCP never writes to it. Identity = `url:main`.
+     */
+    getRootCollectionName(codebasePath: string): string {
+        const repoUrl = getRemoteUrl(codebasePath);
+        if (!repoUrl) return this.getCollectionName(codebasePath);
+        const rootBranchesStr = envManager.get('GIT_ROOT_BRANCHES') || 'main,master';
+        const rootBranch = rootBranchesStr.split(',')[0].trim();
+        const rootIdentity = `${repoUrl}:${rootBranch}`;
+        return this.getCollectionNameForIdentity(rootIdentity);
+    }
+
+    /**
+     * Search across explicit layers. Each layer is `{ collectionName, mask? }`.
+     * The mask excludes base-layer files already overridden by a nearer layer.
+     * Results are globally re-ranked and deduped.
+     *
+     * This is the dev-aware equivalent of `resolveLayerChain` + `semanticSearch`;
+     * it does NOT depend on CommitIndexState.
+     */
+    async searchWithLayers(
+        layers: Array<{ collectionName: string; mask?: string[] }>,
+        query: string,
+        topK: number = 5,
+        threshold: number = 0.5,
+        filterExpr?: string,
+    ): Promise<SemanticSearchResult[]> {
+        const isHybrid = this.getIsHybrid();
+        const searchType = isHybrid === true ? 'hybrid' : 'semantic';
+        console.log(`[Context] 🔍 Dev-aware ${searchType} over ${layers.length} layer(s): "${query}"`);
+
+        if (layers.length === 0) return [];
+
+        // Only search layers whose collection exists.
+        const existence = await Promise.all(
+            layers.map(l => this.vectorDatabase.hasCollection(l.collectionName).catch(() => false)),
+        );
+        const activeLayers = layers.filter((_, i) => existence[i]);
+        if (activeLayers.length === 0) {
+            console.warn('[Context] ⚠️  None of the requested layer collections exist.');
+            return [];
+        }
+
+        // Embed query once.
+        const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+
+        // Multi-layer hybrid → global RRF.
+        if (isHybrid && activeLayers.length > 1 && typeof this.vectorDatabase.sparseSearch === 'function') {
+            const layerObjs = activeLayers.map(l => ({
+                identity: l.collectionName,
+                collectionName: l.collectionName,
+                mask: l.mask || [],
+            }));
+            const fused = await this.globalHybridFusion(layerObjs, queryEmbedding.vector, query, topK, filterExpr);
+            console.log(`[Context] ✅ Dev-aware RRF → ${fused.length} results`);
+            return fused;
+        }
+
+        // Per-layer search + mask.
+        const perLayer = await Promise.all(
+            activeLayers.map(layer => {
+                const layerFilter = this.combineFilters(filterExpr, this.buildMaskFilter(layer.mask || []));
+                return this.searchLayer(
+                    layer.collectionName, queryEmbedding.vector, query, topK, threshold, layerFilter, isHybrid,
+                ).catch(error => {
+                    console.warn(`[Context] ⚠️  Layer search '${layer.collectionName}' failed: ${error}`);
+                    return [] as SemanticSearchResult[];
+                });
+            }),
+        );
+
+        // Global re-rank + dedup.
+        const all: SemanticSearchResult[] = perLayer.flat();
+        all.sort((a, b) => b.score - a.score);
+        const deduped = this.deduplicateResults(all);
+        deduped.sort((a, b) => b.score - a.score);
+        const finalResults = deduped.slice(0, topK);
+        console.log(`[Context] ✅ Dev-aware search: ${all.length} raw → ${finalResults.length} results`);
+        return finalResults;
     }
 }

@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity, isGitRepo, getCurrentBranch, envManager } from "@seeway/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity, getDevFingerprint, getDevRepoIdentity, getBranchIdentity, isGitRepo, getCurrentBranch, envManager } from "@seeway/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, CodebaseInfoIndexFailed, CodebaseInfoIndexing, CodebaseInfoIndexed, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
@@ -545,12 +545,13 @@ export class ToolHandlers {
             const codebaseIdentity = getRepoIdentity(absolutePath);
             console.log(`[IDENTITY] Codebase identity: ${codebaseIdentity} (path: ${absolutePath})`);
 
-            // Git-incremental is available for real git repos unless explicitly disabled.
-            // When available, an "already indexed" repo is NOT an error — we re-enter
-            // background indexing and let syncIndexByGit apply only the git delta.
-            const gitIncrementalEnabled =
-                String(envManager.get('GIT_INCREMENTAL_ENABLED') ?? 'true').toLowerCase() !== 'false' &&
-                isGitRepo(absolutePath);
+            // Dev-aware indexing: each developer gets their own per-branch collection.
+            // No root-branch guard needed — dev collections are always personal.
+            // Merkle-based change detection handles all git operations correctly.
+            const devIdentity = getDevRepoIdentity(absolutePath);
+            const devCollectionName = this.context.getCollectionNameForIdentity(devIdentity);
+
+            console.log(`[DEV-IDENTITY] Dev identity: ${devIdentity} (fingerprint: ${getDevFingerprint()})`);
 
             // Validate path exists
             if (!fs.existsSync(absolutePath)) {
@@ -575,91 +576,15 @@ export class ToolHandlers {
                 };
             }
 
-            // === main/master are server-managed ===
-            // The root branch is kept indexed by the server-side git-index-service
-            // (scheduled GitLab pull). The local MCP must NOT index it — developers
-            // index their feature branches, which layer on top of that server-built
-            // root. The git-index-service calls context.syncIndexByGit directly and
-            // never goes through this handler, so it is unaffected.
-            if (gitIncrementalEnabled) {
-                const rootBranches = String(envManager.get('GIT_ROOT_BRANCHES') ?? 'main,master')
-                    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-                const allowLocalRoot =
-                    String(envManager.get('GIT_ALLOW_LOCAL_ROOT_INDEX') ?? 'false').toLowerCase() === 'true';
-                const currentBranch = (getCurrentBranch(absolutePath) || '').toLowerCase();
-                if (!allowLocalRoot && currentBranch && rootBranches.includes(currentBranch)) {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `分支 '${currentBranch}' 由服务器索引服务托管，本地不索引 ${rootBranches.join('/')}。\n请切到你的特性分支后再索引；${rootBranches[0]} 会由服务器定时从 GitLab 更新，你的分支会自动叠加它作为基座。\n（如确需本地建根：设置环境变量 GIT_ALLOW_LOCAL_ROOT_INDEX=true）`
-                        }],
-                        isError: true
-                    };
-                }
-            }
-
-            // === CRITICAL: Pre-check identity in vector database ===
-            // The index is isolated by url+branch, not by filesystem path.
-            // Check if this identity already has a collection in Milvus before
-            // proceeding. If it does, recover the local snapshot and inform the user.
-            if (!forceReindex) {
-                const identityAlreadyIndexed = await this.context.hasIndex(absolutePath);
-                if (identityAlreadyIndexed) {
-                    // The identity-based collection exists in Milvus.
-                    // Check if the local snapshot knows about it.
-                    const snapshotHasIdentity = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
-                    if (!snapshotHasIdentity) {
-                        // Recover snapshot from Milvus
-                        const stats = await this.queryCollectionStats(absolutePath);
-                        if (stats) {
-                            console.warn(`[IDENTITY-CHECK] Identity '${codebaseIdentity}' already indexed in Milvus but missing from local snapshot. Recovering snapshot.`);
-                            this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
-                            await this.snapshotManager.saveCodebaseSnapshot();
-                        }
-                    }
-
-                    // Git repo → don't error out; fall through to background indexing,
-                    // where syncIndexByGit re-uses the shared index and applies only
-                    // the git delta (or reports "up to date" when HEAD is unchanged).
-                    if (!gitIncrementalEnabled) {
-                        const existingInfo = this.snapshotManager.getCodebaseInfo(codebaseIdentity);
-                        const existingLocalPath = existingInfo?.localPath;
-                        const isSameLocalPath = existingLocalPath && path.resolve(existingLocalPath) === path.resolve(absolutePath);
-
-                        let alreadyMessage = `Repository '${codebaseIdentity}' is already indexed.`;
-                        if (!isSameLocalPath && existingLocalPath) {
-                            alreadyMessage += `\nExisting index is for local checkout at: ${existingLocalPath}`;
-                            alreadyMessage += `\nCurrent path: ${absolutePath}`;
-                            alreadyMessage += `\n\nBoth paths map to the same repository (url+branch), so the index is shared. Use force=true to re-index.`;
-                        } else {
-                            alreadyMessage += ` Use force=true to re-index.`;
-                        }
-                        return {
-                            content: [{
-                                type: "text",
-                                text: alreadyMessage
-                            }],
-                            isError: true
-                        };
-                    }
-                    console.log(`[IDENTITY-CHECK] '${codebaseIdentity}' already indexed; git repo → will run incremental sync.`);
-                }
-            }
-
-            // Check if already indexing (compare by identity: url:branch)
+            // Check if already indexing (dev-aware: uses absolute path, not identity).
             let alreadyCleared = false;
-            if (this.snapshotManager.getIndexingCodebases().includes(codebaseIdentity)) {
+            if (this.indexingTasks.has(absolutePath)) {
                 if (forceReindex) {
-                    console.log(`[FORCE-REINDEX] Clearing stale indexing state for '${absolutePath}'`);
-                    // Cancel the old indexing task and wait for it to finish
-                    const oldTask = this.indexingTasks.get(absolutePath);
-                    if (oldTask) {
-                        oldTask.controller.abort();
-                        try { await oldTask.promise; } catch { /* aborted */ }
-                        this.indexingTasks.delete(absolutePath);
-                    }
-                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
-                    await this.snapshotManager.saveCodebaseSnapshot();
+                    console.log(`[FORCE-REINDEX] Cancelling existing indexing task for '${absolutePath}'`);
+                    const oldTask = this.indexingTasks.get(absolutePath)!;
+                    oldTask.controller.abort();
+                    try { await oldTask.promise; } catch { /* aborted */ }
+                    this.indexingTasks.delete(absolutePath);
                     alreadyCleared = true;
                 } else {
                     return {
@@ -672,54 +597,13 @@ export class ToolHandlers {
                 }
             }
 
-            //Check if the snapshot and cloud index are in sync (compare by identity)
-            // Skip consistency check when forceReindex already cleared the snapshot
-            if (!alreadyCleared) {
-                const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
-                const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
-                if (snapshotHasIndex !== vectorDbHasIndex) {
-                    if (vectorDbHasIndex && !snapshotHasIndex) {
-                        // Query Milvus for real row count. If unknown/empty, log and move on
-                        // without writing 0/0+completed (which would trigger the force-reindex
-                        // loop in Issue #295). The user is about to (re)index anyway.
-                        const stats = await this.queryCollectionStats(absolutePath);
-                        if (stats) {
-                            console.warn(`[INDEX-VALIDATION] Recovering missing snapshot for '${absolutePath}' (rows=${stats.totalChunks})`);
-                            this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
-                            await this.snapshotManager.saveCodebaseSnapshot();
-                        } else {
-                            console.warn(`[INDEX-VALIDATION] VectorDB reports index for '${absolutePath}' but row count unknown/zero — not writing snapshot entry`);
-                        }
-                    } else if (!vectorDbHasIndex && snapshotHasIndex) {
-                        console.warn(`[INDEX-VALIDATION] Clearing stale snapshot for '${absolutePath}'`);
-                        this.snapshotManager.removeCodebaseCompletely(absolutePath);
-                        await this.snapshotManager.saveCodebaseSnapshot();
-                    }
-                }
-            }
-
-            // Check if already indexed (compare by identity, unless force is true).
-            // For git repos we intentionally proceed: syncIndexByGit will re-use the
-            // shared index and apply only the delta (or no-op when HEAD is unchanged).
-            if (!forceReindex && !gitIncrementalEnabled && this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity)) {
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Codebase '${absolutePath}' is already indexed. Use force=true to re-index.`
-                    }],
-                    isError: true
-                };
-            }
-
-            // If force reindex and codebase is already indexed, remove it
-            if (forceReindex) {
-                if (!alreadyCleared) {
-                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
-                    await this.snapshotManager.saveCodebaseSnapshot();
-                }
-                if (await this.context.hasIndex(absolutePath)) {
-                    console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
-                    await this.context.clearIndex(absolutePath);
+            // If force reindex, clear the dev collection.
+            if (forceReindex && !alreadyCleared) {
+                if (await this.context.getVectorDatabase().hasCollection(devCollectionName).catch(() => false)) {
+                    console.log(`[FORCE-REINDEX] 🔄 Clearing dev collection '${devCollectionName}'`);
+                    await this.context.getVectorDatabase().dropCollection(devCollectionName);
+                    // Also delete the Merkle snapshot for this dev+branch.
+                    await FileSynchronizer.deleteSnapshot(absolutePath, devIdentity);
                 }
             }
 
@@ -835,31 +719,8 @@ export class ToolHandlers {
             const ignorePatterns = await this.context.getEffectiveIgnorePatterns(absolutePath, customIgnorePatterns);
             const supportedExtensions = this.context.getEffectiveSupportedExtensions(customFileExtensions);
 
-            // Initialize file synchronizer with proper ignore patterns (including project-specific patterns)
-            console.log(`[BACKGROUND-INDEX] Using ignore patterns: ${ignorePatterns.join(', ')}`);
-            if (customFileExtensions.length > 0) {
-                console.log(`[BACKGROUND-INDEX] Using ${customFileExtensions.length} request-scoped custom extensions: ${customFileExtensions.join(', ')}`);
-            }
-            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, supportedExtensions, this.context.getSupportedFilenames());
-            await synchronizer.initialize();
-
-            // Store synchronizer in the context (let context manage collection names)
-            await this.context.getPreparedCollection(absolutePath);
-            const collectionName = this.context.getCollectionName(absolutePath);
-            this.context.setSynchronizer(collectionName, synchronizer);
-
-            console.log(`[BACKGROUND-INDEX] Starting indexing with ${splitterType} splitter for: ${absolutePath}`);
-
-            // Log embedding provider information before indexing
-            const embeddingProvider = this.context.getEmbedding();
-            console.log(`[BACKGROUND-INDEX] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} with dimension: ${embeddingProvider.getDimension()}`);
-
-            // Start indexing with the appropriate context and progress tracking.
-            // syncIndexByGit picks full vs. git-incremental automatically: a force
-            // reindex already cleared the collection + commit state above, so it
-            // does a full run; an unchanged/advanced HEAD does an incremental delta.
-            console.log(`[BACKGROUND-INDEX] 🚀 Beginning codebase indexing process...`);
-            const stats = await this.context.syncIndexByGit(absolutePath, async (progress) => {
+            console.log(`[BACKGROUND-INDEX] 🚀 Beginning Merkle-based indexing process (dev: ${getDevFingerprint()})...`);
+            const stats = await this.context.syncIndexByMerkle(absolutePath, async (progress) => {
                 // Update progress in snapshot manager using new method
                 this.snapshotManager.setCodebaseIndexing(absolutePath, progress.percentage);
 
@@ -959,53 +820,28 @@ export class ToolHandlers {
 
             trackCodebasePath(absolutePath);
 
-            // Check if this codebase is indexed or being indexed
-            const indexedCodebasePath = this.snapshotManager.findIndexedCodebasePath(absolutePath);
-            const indexingCodebasePath = this.snapshotManager.findIndexingCodebasePath(absolutePath);
-            // Prefer indexed over indexing (identity-based lookup, no need for path length sort)
-            const matchedCodebase = indexedCodebasePath || indexingCodebasePath;
-            let searchCodebasePath = matchedCodebase || absolutePath;
-            let isIndexed = indexedCodebasePath === searchCodebasePath;
-            const isIndexing = indexingCodebasePath === searchCodebasePath;
+            // Dev-aware search: check if dev collection exists, fall back to root.
+            const devColl = this.context.getDevCollectionName(absolutePath);
+            const rootColl = this.context.getRootCollectionName(absolutePath);
+            const vdbSearch = this.context.getVectorDatabase();
+            const devExistsPre = await vdbSearch.hasCollection(devColl).catch(() => false);
+            const rootExistsPre = await vdbSearch.hasCollection(rootColl).catch(() => false);
 
-            if (!isIndexed && !isIndexing) {
-                // Fallback: check VectorDB directly in case snapshot is out of sync.
-                // Only recover the snapshot when we can confirm a real row count —
-                // writing 0/0+completed for an unverifiable collection poisons the
-                // client into a force-reindex loop (Issue #295).
-                const hasVectorIndex = await this.context.hasIndex(absolutePath);
-                if (hasVectorIndex) {
-                    const stats = await this.queryCollectionStats(absolutePath);
-                    if (stats) {
-                        console.warn(`[SEARCH] Snapshot missing but VectorDB has index for '${absolutePath}', recovering snapshot (rows=${stats.totalChunks})`);
-                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
-                        await this.snapshotManager.saveCodebaseSnapshot();
-                        searchCodebasePath = absolutePath;
-                        isIndexed = true;
-                        // Continue with search (don't return error)
-                    } else {
-                        return {
-                            content: [{
-                                type: "text",
-                                text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.`
-                            }],
-                            isError: true
-                        };
-                    }
-                } else {
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.`
-                        }],
-                        isError: true
-                    };
-                }
+            if (!devExistsPre && !rootExistsPre) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: Codebase '${absolutePath}' is not indexed. Neither a personal dev index nor a shared root index was found. Please index it first using the index tool.`
+                    }],
+                    isError: true
+                };
             }
 
-            // The vector index exists (shared cloud); make sure the local graph
-            // is being built too, so results get graph enrichment. No-op if the
-            // graph is already present or building. Non-blocking.
+            // Check if currently indexing
+            const indexingCodebasePath = this.snapshotManager.findIndexingCodebasePath(absolutePath);
+            const isIndexing = !!indexingCodebasePath;
+
+            // The vector index exists; make sure the local graph is being built too.
             this.maybeAutoBuildGraphIndex(absolutePath);
 
             // Show indexing status if codebase is being indexed
@@ -1014,7 +850,7 @@ export class ToolHandlers {
                 indexingStatusMessage = `\n⚠️  **Indexing in Progress**: This codebase is currently being indexed in the background. Search results may be incomplete until indexing completes.`;
             }
 
-            console.log(`[SEARCH] Searching in codebase: ${searchCodebasePath}`);
+            console.log(`[SEARCH] Searching in codebase: ${absolutePath} (dev=${devExistsPre}, root=${rootExistsPre})`);
             console.log(`[SEARCH] Query: "${query}"`);
             console.log(`[SEARCH] Indexing status: ${isIndexing ? 'In Progress' : 'Completed'}`);
 
@@ -1041,14 +877,49 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
-            // Search in the specified codebase
-            const searchResults = await this.context.semanticSearch(
-                searchCodebasePath,
-                query,
-                Math.min(resultLimit, 50),
-                tuning.threshold,
-                filterExpr
-            );
+            // ── Dev-aware search: dev collection (full copy) → root collection (fallback) ──
+            const devCollectionName = this.context.getDevCollectionName(absolutePath);
+            const rootCollectionName = this.context.getRootCollectionName(absolutePath);
+            const vdb = this.context.getVectorDatabase();
+
+            // Determine which layers to search.
+            const devExists = await vdb.hasCollection(devCollectionName).catch(() => false);
+            const rootExists = await vdb.hasCollection(rootCollectionName).catch(() => false);
+
+            let searchResults: Awaited<ReturnType<typeof this.context.searchWithLayers>>;
+            let searchSourceNote = '';
+
+            if (devExists) {
+                // Dev has indexed → use dev collection (complete working-tree snapshot).
+                searchResults = await this.context.searchWithLayers(
+                    [{ collectionName: devCollectionName }],
+                    query,
+                    Math.min(resultLimit, 50),
+                    tuning.threshold,
+                    filterExpr,
+                );
+                searchSourceNote = ' (dev index)';
+                console.log(`[SEARCH] ✅ Dev-aware search on dev collection '${devCollectionName}'`);
+            } else if (rootExists) {
+                // Dev hasn't indexed → fall back to shared root.
+                searchResults = await this.context.searchWithLayers(
+                    [{ collectionName: rootCollectionName }],
+                    query,
+                    Math.min(resultLimit, 50),
+                    tuning.threshold,
+                    filterExpr,
+                );
+                searchSourceNote = ' (root fallback — run index for your dev copy)';
+                console.log(`[SEARCH] ⚠️  No dev collection, falling back to root '${rootCollectionName}'`);
+            } else {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: Codebase '${absolutePath}' is not indexed. Neither a personal dev index nor a shared root index was found. Please index first using the index tool.`
+                    }],
+                    isError: true
+                };
+            }
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
@@ -1056,7 +927,7 @@ export class ToolHandlers {
                 // Fallback: try graph search when vector search returns nothing
                 if (this.graphToolHandlers && query.trim().length > 0) {
                     try {
-                        const project = getRepoIdentity(searchCodebasePath);
+                        const project = getRepoIdentity(absolutePath);
                         const graphResult = this.graphToolHandlers.handleSearchGraph({
                             project,
                             query: query,
@@ -1074,24 +945,12 @@ export class ToolHandlers {
                     } catch { }
                 }
 
-                // Check if collection was lost (indexed locally but missing in Milvus)
-                if (isIndexed && !isIndexing) {
-                    const collectionName = this.context.getCollectionName(searchCodebasePath);
-                    const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
-                    if (!hasCollection) {
-                        return {
-                            content: [{ type: "text", text: `Error: Index data for '${searchCodebasePath}' has been lost (collection not found in Milvus). Please re-index using index_codebase with force=true.` }],
-                            isError: true
-                        };
-                    }
-                }
-
-                let noResultsMessage = `No results found for query: "${query}" in codebase '${searchCodebasePath}'`;
-                if (searchCodebasePath !== absolutePath) {
-                    noResultsMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
-                }
+                let noResultsMessage = `No results found for query: "${query}" in codebase '${absolutePath}'${searchSourceNote}`;
                 if (isIndexing) {
-                    noResultsMessage += `\n\nNote: This codebase is still being indexed. Try searching again after indexing completes, or the query may not match any indexed content.`;
+                    noResultsMessage += `\n\nNote: This codebase is still being indexed. Try searching again after indexing completes.`;
+                }
+                if (!devExists) {
+                    noResultsMessage += `\n\n💡 Tip: Run the index tool to create your personal dev index for the most accurate results.`;
                 }
                 return {
                     content: [{
@@ -1137,7 +996,7 @@ export class ToolHandlers {
             const formattedResults = scoredResults.map((result: any, index: number) => {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
                 const context = truncateContent(result.content, tuning.snippetMaxChars);
-                const codebaseInfo = path.basename(searchCodebasePath);
+                const codebaseInfo = path.basename(absolutePath);
 
                 return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
                     `   Location: ${location}\n` +
@@ -1149,10 +1008,7 @@ export class ToolHandlers {
             const dupNote = mergedCount > 0
                 ? ` (${mergedCount} overlapping/low-score snippet(s) trimmed)`
                 : '';
-            let resultMessage = `Found ${scoredResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${dupNote}${indexingStatusMessage}`;
-            if (searchCodebasePath !== absolutePath) {
-                resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
-            }
+            let resultMessage = `Found ${scoredResults.length} results for query: "${query}" in codebase '${absolutePath}'${dupNote}${searchSourceNote}${indexingStatusMessage}`;
             resultMessage += `\n\n${formattedResults}`;
 
             // ── Graph Context Enrichment (deep 3-layer) ──────────────────
@@ -1160,7 +1016,7 @@ export class ToolHandlers {
                 try {
                     resultMessage += this.enrichWithGraphContextDeep(
                         scoredResults,
-                        searchCodebasePath,
+                        absolutePath,
                     );
                 } catch (graphErr: any) {
                     console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
@@ -1242,27 +1098,13 @@ export class ToolHandlers {
                 };
             }
 
-            // Compare by identity (url:branch), not by absolute path
-            const codebaseIdentity = getRepoIdentity(absolutePath);
-            const isIndexed = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
-            const isIndexing = this.snapshotManager.getIndexingCodebases().includes(codebaseIdentity);
+            // Dev-aware clearing: clear the developer's personal collection and Merkle snapshot.
+            const devIdentity = getDevRepoIdentity(absolutePath);
+            const devCollectionName = this.context.getCollectionNameForIdentity(devIdentity);
 
-            if (!isIndexed && !isIndexing) {
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error: Codebase '${absolutePath}' (identity: ${codebaseIdentity}) is not indexed or being indexed.`
-                    }],
-                    isError: true
-                };
-            }
+            console.log(`[CLEAR] Clearing dev collection: ${devCollectionName} (dev: ${getDevFingerprint()})`);
 
-            console.log(`[CLEAR] Clearing codebase: ${absolutePath}`);
-
-            // Cancel any in-flight background indexing for this codebase and
-            // wait for it to wind down before we drop the collection.
-            // Otherwise the background task keeps embedding chunks and writes
-            // them into the just-cleared collection (issue #199).
+            // Cancel any in-flight background indexing for this codebase.
             const activeTask = this.indexingTasks.get(absolutePath);
             if (activeTask) {
                 console.log(`[CLEAR] Cancelling in-flight background indexing for: ${absolutePath}`);
@@ -1270,16 +1112,20 @@ export class ToolHandlers {
                 try {
                     await activeTask.promise;
                 } catch (waitError: any) {
-                    // startBackgroundIndexing already logs and never re-throws,
-                    // so this catch only guards against future refactors.
                     console.warn(`[CLEAR] Background indexing wind-down reported: ${waitError?.message || waitError}`);
                 }
                 this.indexingTasks.delete(absolutePath);
             }
 
+            // Drop the dev collection from Milvus.
             try {
-                await this.context.clearIndex(absolutePath);
-                console.log(`[CLEAR] Successfully cleared vector index for: ${absolutePath}`);
+                const vdb = this.context.getVectorDatabase();
+                if (await vdb.hasCollection(devCollectionName).catch(() => false)) {
+                    await vdb.dropCollection(devCollectionName);
+                    console.log(`[CLEAR] Successfully cleared dev collection: ${devCollectionName}`);
+                } else {
+                    console.log(`[CLEAR] Dev collection '${devCollectionName}' does not exist — nothing to clear.`);
+                }
             } catch (error: any) {
                 const errorMsg = `Failed to clear ${absolutePath}: ${error.message}`;
                 console.error(`[CLEAR] ${errorMsg}`);
@@ -1292,16 +1138,25 @@ export class ToolHandlers {
                 };
             }
 
+            // Delete the dev-aware Merkle snapshot.
+            try {
+                await FileSynchronizer.deleteSnapshot(absolutePath, devIdentity);
+                console.log(`[CLEAR] Deleted Merkle snapshot for dev identity: ${devIdentity}`);
+            } catch (snapErr: any) {
+                console.warn(`[CLEAR] Failed to delete Merkle snapshot (non-fatal): ${snapErr.message}`);
+            }
+
             // Also clear the graph index to keep vector + graph in sync
+            // Also clear the graph index.
             if (this.graphToolHandlers) {
+                const branchIdentity = getBranchIdentity(absolutePath);
                 try {
                     this.graphToolHandlers.getStore().beginTransaction();
-                    this.graphToolHandlers.getStore().deleteProject(codebaseIdentity);
+                    this.graphToolHandlers.getStore().deleteProject(branchIdentity);
                     this.graphToolHandlers.getStore().commitTransaction();
-                    console.log(`[CLEAR] Successfully cleared graph index for: ${codebaseIdentity}`);
+                    console.log(`[CLEAR] Successfully cleared graph index for: ${branchIdentity}`);
                 } catch (graphError: any) {
-                    console.warn(`[CLEAR] Failed to clear graph index for '${codebaseIdentity}': ${graphError.message}`);
-                    // Non-fatal: vector index is already cleared, graph data can be cleaned up later
+                    console.warn(`[CLEAR] Failed to clear graph index for '${branchIdentity}': ${graphError.message}`);
                 }
             }
 
@@ -1504,23 +1359,32 @@ export class ToolHandlers {
                 }
             }
 
-            // Fallback: the snapshot is keyed by filesystem path, but the Milvus
-            // collection is keyed by url+branch identity. When neither the in-memory
-            // map nor the on-disk snapshot has an entry we must still consult the
-            // VectorDB — the same recovery handleSearchCode does — so the status
-            // stays consistent with the actual url+branch-isolated collection.
+            // Dev-aware fallback: check the developer's personal collection
+            // and the shared root collection in Milvus.
             if (status === 'not_found') {
-                const hasVectorIndex = await this.context.hasIndex(absolutePath);
-                if (hasVectorIndex) {
+                const devCol = this.context.getDevCollectionName(absolutePath);
+                const rootCol = this.context.getRootCollectionName(absolutePath);
+                const vdbStatus = this.context.getVectorDatabase();
+                const [devExists, rootExists] = await Promise.all([
+                    vdbStatus.hasCollection(devCol).catch(() => false),
+                    vdbStatus.hasCollection(rootCol).catch(() => false),
+                ]);
+                if (devExists) {
                     const stats = await this.queryCollectionStats(absolutePath);
                     if (stats) {
-                        console.warn(`[STATUS] Snapshot missing but VectorDB has index for '${absolutePath}', recovering snapshot (rows=${stats.totalChunks})`);
+                        console.warn(`[STATUS] Found dev collection '${devCol}', recovering snapshot`);
                         this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
                         await this.snapshotManager.saveCodebaseSnapshot();
                         statusCodebasePath = absolutePath;
                         status = this.snapshotManager.getCodebaseStatus(statusCodebasePath);
                         info = this.snapshotManager.getCodebaseInfo(statusCodebasePath);
+                    } else if (rootExists) {
+                        info = { status: 'indexed', localPath: absolutePath, indexedFiles: 0, totalChunks: 0, indexStatus: 'completed', lastUpdated: new Date().toISOString() } as any;
+                        status = 'indexed';
                     }
+                } else if (rootExists) {
+                    info = { status: 'indexed', localPath: absolutePath, indexedFiles: 0, totalChunks: 0, indexStatus: 'completed', lastUpdated: new Date().toISOString() } as any;
+                    status = 'indexed';
                 }
             }
 
