@@ -20,8 +20,8 @@ export class ToolHandlers {
      */
     private graphToolHandlers: GraphToolHandlers | null = null;
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
-    private lastCloudSyncMs: number = 0;
-    private static readonly CLOUD_SYNC_THROTTLE_MS = 60_000;
+    private lastCollectionSyncMs: number = 0;
+    private static readonly COLLECTION_SYNC_THROTTLE_MS = 60_000;
     /**
      * Projects for which we've already kicked off an automatic local graph
      * build this session. The vector index is shared via the cloud, but the
@@ -53,7 +53,7 @@ export class ToolHandlers {
      * token-lean context over exhaustive recall:
      *  - SEARCH_DEFAULT_LIMIT   fallback result count when caller omits `limit` (default 10)
      *  - SEARCH_THRESHOLD       min cosine score, dense (non-hybrid) path only (default 0.3)
-     *  - SEARCH_SNIPPET_MAX_CHARS  per-snippet char cap (default 2500 ≈ 625 tokens; was 5000)
+     *  - SEARCH_SNIPPET_MAX_CHARS  per-snippet char cap (default 4000 ≈ 1000 tokens)
      *  - SEARCH_SCORE_RATIO     relative tail cutoff in [0,1]; drop results scoring
      *                           below ratio×topScore. 0 disables. Works in both
      *                           dense and hybrid/RRF modes since it's relative. (default 0)
@@ -68,7 +68,7 @@ export class ToolHandlers {
         return {
             defaultLimit: Math.max(1, Math.min(50, num('SEARCH_DEFAULT_LIMIT', 10))),
             threshold: num('SEARCH_THRESHOLD', 0.3),
-            snippetMaxChars: Math.max(200, num('SEARCH_SNIPPET_MAX_CHARS', 2500)),
+            snippetMaxChars: Math.max(200, num('SEARCH_SNIPPET_MAX_CHARS', 4000)),
             scoreRatio: Math.max(0, Math.min(1, num('SEARCH_SCORE_RATIO', 0))),
         };
     }
@@ -198,14 +198,14 @@ export class ToolHandlers {
     }
 
     /**
-     * Sync indexed codebases from Zilliz Cloud collections
+     * Sync indexed codebases from collection collections
      * This method fetches all collections from the vector database,
      * extracts codebasePath from collection description (preferred) or falls back
      * to querying document metadata for old collections,
      * and updates the snapshot with discovered codebases.
      *
-     * Logic: Compare mcp-codebase-snapshot.json with Zilliz Cloud collections
-     * - If local snapshot has extra directories (not in cloud), remove them
+     * Logic: Compare mcp-codebase-snapshot.json with collection collections
+     * - If local snapshot has extra directories (not in collections), remove them
      * - If local snapshot is missing directories (exist in cloud), ignore them
      */
 
@@ -219,7 +219,7 @@ export class ToolHandlers {
         vectorDb: any,
     ): Promise<{ codebasePath: string } | null> {
         try {
-            console.log(`[SYNC-CLOUD] 🔍 Checking collection: ${collectionName}`);
+            console.log(`[COLLECTION-SYNC] 🔍 Checking collection: ${collectionName}`);
 
             // Try to extract codebasePath from collection description first (new format)
             try {
@@ -230,16 +230,16 @@ export class ToolHandlers {
                     const rawPath = description.substring('codebasePath:'.length);
                     const codebasePath = rawPath.split('|')[0];
                     if (codebasePath.length > 0) {
-                        console.log(`[SYNC-CLOUD] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
+                        console.log(`[COLLECTION-SYNC] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
                         return { codebasePath };
                     }
                 }
             } catch (descError: any) {
-                console.warn(`[SYNC-CLOUD] ⚠️  Failed to get description for collection ${collectionName}:`, descError.message || descError);
+                console.warn(`[COLLECTION-SYNC] ⚠️  Failed to get description for collection ${collectionName}:`, descError.message || descError);
             }
 
             // Fallback: query document metadata for old collections without new description format
-            console.log(`[SYNC-CLOUD] 🔄 Falling back to query-based extraction for collection: ${collectionName}`);
+            console.log(`[COLLECTION-SYNC] 🔄 Falling back to query-based extraction for collection: ${collectionName}`);
             try {
                 const results = await vectorDb.query(
                     collectionName,
@@ -257,38 +257,37 @@ export class ToolHandlers {
                         const codebasePath = metadata.codebasePath;
 
                         if (codebasePath && typeof codebasePath === 'string') {
-                            console.log(`[SYNC-CLOUD] 📍 Found codebase path from query: ${codebasePath} in collection: ${collectionName}`);
+                            console.log(`[COLLECTION-SYNC] 📍 Found codebase path from query: ${codebasePath} in collection: ${collectionName}`);
                             return { codebasePath };
                         } else {
-                            console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
+                            console.warn(`[COLLECTION-SYNC] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
                         }
                     } else {
-                        console.warn(`[SYNC-CLOUD] ⚠️  No metadata found in collection: ${collectionName}`);
+                        console.warn(`[COLLECTION-SYNC] ⚠️  No metadata found in collection: ${collectionName}`);
                     }
                 } else {
-                    console.log(`[SYNC-CLOUD] ℹ️  Collection ${collectionName} is empty`);
+                    console.log(`[COLLECTION-SYNC] ℹ️  Collection ${collectionName} is empty`);
                 }
             } catch (queryError: any) {
-                console.warn(`[SYNC-CLOUD] ⚠️  Fallback query failed for collection ${collectionName}:`, queryError.message || queryError);
+                console.warn(`[COLLECTION-SYNC] ⚠️  Fallback query failed for collection ${collectionName}:`, queryError.message || queryError);
             }
 
             return null;
         } catch (collectionError: any) {
-            console.warn(`[SYNC-CLOUD] ⚠️  Error checking collection ${collectionName}:`, collectionError.message || collectionError);
+            console.warn(`[COLLECTION-SYNC] ⚠️  Error checking collection ${collectionName}:`, collectionError.message || collectionError);
             return null;
         }
     }
 
-    private async syncIndexedCodebasesFromCloud(): Promise<void> {
+    private async syncCollectionState(): Promise<void> {
         const now = Date.now();
-        if (now - this.lastCloudSyncMs < ToolHandlers.CLOUD_SYNC_THROTTLE_MS) {
-            console.log(`[SYNC-CLOUD] ⏭️  Skipping cloud sync (throttled, last run ${Math.round((now - this.lastCloudSyncMs) / 1000)}s ago)`);
+        if (now - this.lastCollectionSyncMs < ToolHandlers.COLLECTION_SYNC_THROTTLE_MS) {
+            console.log(`[COLLECTION-SYNC] ⏭️  Skipping sync (throttled, last run ${Math.round((now - this.lastCollectionSyncMs) / 1000)}s ago)`);
             return;
         }
         try {
-            // Clear stale identity cache before syncing (handles remote URL/branch changes)
             this.snapshotManager.clearIdentityCache();
-            console.log(`[SYNC-CLOUD] 🔄 Syncing indexed codebases from Zilliz Cloud...`);
+            console.log(`[COLLECTION-SYNC] 🔄 Syncing indexed codebases from collections...`);
 
             // Get all collections using the interface method
             const vectorDb = this.context.getVectorDatabase();
@@ -296,10 +295,10 @@ export class ToolHandlers {
             // Use the new listCollections method from the interface
             const collections = await vectorDb.listCollections();
 
-            console.log(`[SYNC-CLOUD] 📋 Found ${collections.length} collections in Zilliz Cloud`);
+            console.log(`[COLLECTION-SYNC] 📋 Found ${collections.length} collections in collection`);
 
             if (collections.length === 0) {
-                console.log(`[SYNC-CLOUD] ✅ No collections found in cloud. Skipping deletion of local codebases to avoid data loss from transient errors.`);
+                console.log(`[COLLECTION-SYNC] ✅ No collections found. Skipping deletion of local codebases.`);
                 return;
             }
 
@@ -314,7 +313,7 @@ export class ToolHandlers {
             );
 
             if (codeCollections.length === 0) {
-                console.log(`[SYNC-CLOUD] ✅ No code collections found in cloud.`);
+                console.log(`[COLLECTION-SYNC] ✅ No code collections found.`);
                 return;
             }
 
@@ -338,13 +337,13 @@ export class ToolHandlers {
                 }
             }
 
-            console.log(`[SYNC-CLOUD] 📊 Found ${cloudCodebases.size} valid codebases in cloud (checked ${codeCollectionsChecked} code collections, ${successfulExtractions} successfully extracted)`);
+            console.log(`[COLLECTION-SYNC] 📊 Found ${cloudCodebases.size} valid codebases in collections (checked ${codeCollectionsChecked} code collections, ${successfulExtractions} successfully extracted)`);
 
             // Safety guard: if we checked code collections but none returned results,
             // treat this as an extraction failure rather than "cloud is empty".
             // This prevents deleting all local codebases due to transient errors.
             if (codeCollectionsChecked > 0 && successfulExtractions === 0) {
-                console.warn(`[SYNC-CLOUD] ⚠️  All ${codeCollectionsChecked} code collection extractions failed. Skipping sync to avoid accidental deletion of local codebases.`);
+                console.warn(`[COLLECTION-SYNC] ⚠️  All ${codeCollectionsChecked} code collection extractions failed. Skipping sync to avoid accidental deletion of local codebases.`);
                 return;
             }
 
@@ -358,7 +357,7 @@ export class ToolHandlers {
                     localIdentityMap.set(identity, info.localPath);
                 }
             }
-            console.log(`[SYNC-CLOUD] 📊 Found ${localIdentities.length} local codebases in snapshot`);
+            console.log(`[COLLECTION-SYNC] 📊 Found ${localIdentities.length} local codebases in snapshot`);
 
             let hasChanges = false;
 
@@ -373,10 +372,10 @@ export class ToolHandlers {
                     try {
                         await FileSynchronizer.deleteSnapshot(localPath);
                     } catch (error: any) {
-                        console.warn(`[SYNC-CLOUD] ⚠️  Failed to delete local merkle snapshot for removed codebase '${localPath}':`, error?.message || error);
+                        console.warn(`[COLLECTION-SYNC] ⚠️  Failed to delete local merkle snapshot for removed codebase '${localPath}':`, error?.message || error);
                     }
 
-                    console.log(`[SYNC-CLOUD] ➖ Removed local codebase (not in cloud): ${localPath} (identity: ${identity})`);
+                    console.log(`[COLLECTION-SYNC] ➖ Removed local codebase (not in collections): ${localPath} (identity: ${identity})`);
                 }
             }
 
@@ -385,7 +384,7 @@ export class ToolHandlers {
             // Otherwise we rely on the Milvus fallback in search/status handlers.
             for (const cloudIdentity of cloudCodebases) {
                 if (!localIdentityMap.has(cloudIdentity)) {
-                    console.log(`[SYNC-CLOUD] ⏭️  Cloud codebase '${cloudIdentity}' has no local checkout — will be resolved via Milvus fallback on demand`);
+                    console.log(`[COLLECTION-SYNC] ⏭️  Cloud codebase '${cloudIdentity}' has no local checkout — will be resolved via Milvus fallback on demand`);
                     continue;
                 }
 
@@ -397,23 +396,23 @@ export class ToolHandlers {
                         status: 'completed' as const
                     });
                     hasChanges = true;
-                    console.log(`[SYNC-CLOUD] ➕ Recovered codebase from cloud: ${localPath} (identity: ${cloudIdentity}, rows=${stats.totalChunks})`);
+                    console.log(`[COLLECTION-SYNC] ➕ Recovered codebase from collections: ${localPath} (identity: ${cloudIdentity}, rows=${stats.totalChunks})`);
                 } else {
-                    console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${localPath} (row count unknown or zero)`);
+                    console.log(`[COLLECTION-SYNC] ⏭️  Skipped recovery for ${localPath} (row count unknown or zero)`);
                 }
             }
 
             if (hasChanges) {
                 await this.snapshotManager.saveCodebaseSnapshot();
-                console.log(`[SYNC-CLOUD] 💾 Updated snapshot to match cloud state`);
+                console.log(`[COLLECTION-SYNC] 💾 Updated snapshot to match collection state`);
             } else {
-                console.log(`[SYNC-CLOUD] ✅ Local snapshot already matches cloud state`);
+                console.log(`[COLLECTION-SYNC] ✅ Local snapshot already matches cloud state`);
             }
 
-            console.log(`[SYNC-CLOUD] ✅ Cloud sync completed successfully`);
-            this.lastCloudSyncMs = Date.now();
+            console.log(`[COLLECTION-SYNC] ✅ Collection sync completed successfully`);
+            this.lastCollectionSyncMs = Date.now();
         } catch (error: any) {
-            console.error(`[SYNC-CLOUD] ❌ Error syncing codebases from cloud:`, error.message || error);
+            console.error(`[COLLECTION-SYNC] ❌ Error syncing codebases from collections:`, error.message || error);
             // Don't throw - this is not critical for the main functionality
         }
     }
@@ -515,9 +514,9 @@ export class ToolHandlers {
         const customIgnorePatterns = ignorePatterns || [];
 
         try {
-            // Sync indexed codebases from cloud in background — don't block indexing
-            void this.syncIndexedCodebasesFromCloud().catch(err =>
-                console.warn('[CLOUD-SYNC] Background sync failed:', err?.message || err)
+            // Sync collection state in background — don't block indexing
+            void this.syncCollectionState().catch(err =>
+                console.warn('[COLLECTION-SYNC] Background sync failed:', err?.message || err)
             );
 
             // Validate splitter parameter
@@ -608,7 +607,7 @@ export class ToolHandlers {
             // CRITICAL: Pre-index collection creation validation
             // NOTE: Skipping checkCollectionLimit on self-hosted Milvus
             // (it creates/drops a dummy collection, with 15s timeout).
-            // Re-enable only when using Zilliz Cloud with collection limits.
+            // Re-enable only when using collection with collection limits.
             // try {
             //     console.log(`[INDEX-VALIDATION] 🔍 Validating collection creation capability`);
             //     const canCreateCollection = await this.context.getVectorDatabase().checkCollectionLimit();
@@ -781,13 +780,16 @@ export class ToolHandlers {
 
     public async handleSearchCode(args: any) {
         const tuning = this.getSearchTuning();
-        const { path: codebasePath = ".", query, limit, extensionFilter } = args;
+        const { path: codebasePath = ".", query, limit, extensionFilter, mode, enrich, style } = args;
+        const searchMode: 'vector' | 'graph' | 'both' = (mode === 'graph') ? 'graph' : (mode === 'vector') ? 'vector' : 'both';
+        const doEnrich = searchMode === 'both' && enrich !== false;
+        const compactStyle = style === 'compact';
         const resultLimit = limit || tuning.defaultLimit;
 
         try {
-            // Sync indexed codebases from cloud in background — don't block indexing
-            void this.syncIndexedCodebasesFromCloud().catch(err =>
-                console.warn('[CLOUD-SYNC] Background sync failed:', err?.message || err)
+            // Sync collection state in background — don't block indexing
+            void this.syncCollectionState().catch(err =>
+                console.warn('[COLLECTION-SYNC] Background sync failed:', err?.message || err)
             );
 
             // Resolve path: supports absolute, relative, and "." for workspace auto-detection
@@ -886,6 +888,7 @@ export class ToolHandlers {
 
             let searchResults: Awaited<ReturnType<typeof this.context.searchWithLayers>>;
             let searchSourceNote = '';
+            let resultMessage = '';
 
             // Build the layer chain. Dev collection is always primary (full
             // working-tree snapshot). Root collection is secondary — it
@@ -914,120 +917,105 @@ export class ToolHandlers {
                 };
             }
 
-            searchResults = await this.context.searchWithLayers(
-                layers,
-                query,
-                Math.min(resultLimit, 50),
-                tuning.threshold,
-                filterExpr,
-            );
+            // ── Dual-mode search: vector + graph, or single-mode ──
+            let vectorResults: any[] = [];
+            let graphResultText = '';
 
-            if (layers.length > 1) {
-                searchSourceNote = ' (dev ⊕ root)';
-                console.log(`[SEARCH] ✅ Two-layer search: dev '${devCollectionName}' ⊕ root '${rootCollectionName}'`);
-            } else if (devExists) {
-                searchSourceNote = ' (dev index)';
-                console.log(`[SEARCH] ✅ Dev-only search on '${devCollectionName}'`);
-            } else {
-                searchSourceNote = ' (root fallback — run index for your dev copy)';
-                console.log(`[SEARCH] ⚠️  Root-only search on '${rootCollectionName}'`);
+            if (searchMode !== 'graph') {
+                searchResults = await this.context.searchWithLayers(
+                    layers,
+                    query,
+                    Math.min(resultLimit, 50),
+                    tuning.threshold,
+                    filterExpr,
+                );
+
+                if (layers.length > 1) {
+                    searchSourceNote = ' (dev ⊕ root)';
+                } else if (devExists) {
+                    searchSourceNote = ' (dev index)';
+                } else {
+                    searchSourceNote = ' (root fallback — run index for your dev copy)';
+                }
+
+                // Score cutoff
+                let scored = searchResults;
+                if (tuning.scoreRatio > 0 && scored.length > 1) {
+                    const topScore = Number(scored[0]?.score) || 0;
+                    if (topScore > 0) {
+                        const floor = topScore * tuning.scoreRatio;
+                        scored = scored.filter((r: any, i: number) =>
+                            i === 0 || (Number(r.score) || 0) >= floor
+                        );
+                    }
+                }
+                vectorResults = scored;
             }
 
-            console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
-
-            if (searchResults.length === 0) {
-                // Fallback: try graph search when vector search returns nothing
-                if (this.graphToolHandlers && query.trim().length > 0) {
-                    try {
-                        const project = getRepoIdentity(absolutePath);
-                        const graphResult = this.graphToolHandlers.handleSearchGraph({
-                            project,
-                            query: query,
-                            limit: 10,
-                        });
-                        const graphText = graphResult.content[0]?.text || '';
-                        if (!graphText.includes('Found 0 results')) {
-                            return {
-                                content: [{
-                                    type: 'text', text:
-                                        `No vector search results. Found graph matches:\n\n${graphText}`
-                                }]
-                            };
-                        }
-                    } catch { }
-                }
-
-                let noResultsMessage = `No results found for query: "${query}" in codebase '${absolutePath}'${searchSourceNote}`;
-                if (isIndexing) {
-                    noResultsMessage += `\n\nNote: This codebase is still being indexed. Try searching again after indexing completes.`;
-                }
-                if (!devExists) {
-                    noResultsMessage += `\n\n💡 Tip: Run the index tool to create your personal dev index for the most accurate results.`;
-                }
-                return {
-                    content: [{
-                        type: "text",
-                        text: noResultsMessage
-                    }]
-                };
+            // Append graph results if mode=graph or mode=both and graph handlers exist
+            if (searchMode !== 'vector' && this.graphToolHandlers && query.trim().length > 0) {
+                try {
+                    const project = getRepoIdentity(absolutePath);
+                    const gr = this.graphToolHandlers.handleSearchGraph({
+                        project,
+                        query,
+                        limit: Math.min(resultLimit, 10),
+                    });
+                    const gText = gr.content[0]?.text || '';
+                    if (gText && !gText.startsWith('Found 0 results')) {
+                        graphResultText = gText;
+                    }
+                } catch {}
             }
 
-            // Relative-score tail cutoff. Results are rank-ordered (best first),
-            // so once a result scores below ratio×topScore it's a weak match that
-            // mostly wastes tokens. Dedup is already handled by searchWithLayers
-            // (>50% overlap threshold) — no second pass needed here.
-            let scoredResults = searchResults;
-            if (tuning.scoreRatio > 0 && scoredResults.length > 1) {
-                const topScore = Number(scoredResults[0]?.score) || 0;
-                if (topScore > 0) {
-                    const floor = topScore * tuning.scoreRatio;
-                    scoredResults = scoredResults.filter((r: any, i: number) =>
-                        i === 0 || (Number(r.score) || 0) >= floor
-                    );
-                }
+            // ── No results found ──
+            if (vectorResults.length === 0 && !graphResultText) {
+                let noMsg = `No results for "${query}" in '${absolutePath}'${searchSourceNote}`;
+                if (isIndexing) noMsg += `\nIndexing in progress — retry later.`;
+                if (!devExists) noMsg += `\nTip: run index tool first.`;
+                return { content: [{ type: "text", text: noMsg }] };
             }
 
-            // Format results
-            const formattedResults = scoredResults.map((result: any, index: number) => {
-                const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
-                const context = truncateContent(result.content, tuning.snippetMaxChars);
-                const codebaseInfo = path.basename(absolutePath);
+            // ── Format vector results ──
+            if (vectorResults.length > 0) {
+                const items = vectorResults.map((r: any, i: number) => {
+                    const loc = `${r.relativePath}:${r.startLine}-${r.endLine}`;
+                    if (compactStyle) {
+                        return `[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}`;
+                    }
+                    const code = truncateContent(r.content, tuning.snippetMaxChars);
+                    return `[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}\n\`\`\`${r.language}\n${code}\n\`\`\``;
+                }).join(compactStyle ? '\n' : '\n\n');
 
-                return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
-                    `   Location: ${location}\n` +
-                    `   Rank: ${index + 1}\n` +
-                    `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
-            }).join('\n');
+                const modeTag = searchMode === 'both' ? ' vector+graph' : '';
+                resultMessage = `${vectorResults.length}${modeTag} hits for "${query}"${searchSourceNote}${indexingStatusMessage}\n${items}\n`;
+            }
 
-            const mergedCount = searchResults.length - scoredResults.length;
-            const dupNote = mergedCount > 0
-                ? ` (${mergedCount} overlapping/low-score snippet(s) trimmed)`
-                : '';
-            let resultMessage = `Found ${scoredResults.length} results for query: "${query}" in codebase '${absolutePath}'${dupNote}${searchSourceNote}${indexingStatusMessage}`;
-            resultMessage += `\n\n${formattedResults}`;
-
-            // ── Graph Context Enrichment (deep 3-layer) ──────────────────
-            if (this.graphToolHandlers) {
+            // ── Graph enrichment (both mode only, when enrich !== false) ──
+            if (doEnrich && this.graphToolHandlers && vectorResults.length > 0) {
                 try {
                     resultMessage += this.enrichWithGraphContextDeep(
-                        scoredResults,
+                        vectorResults.slice(0, 5),
                         absolutePath,
+                        query,
                     );
                 } catch (graphErr: any) {
                     console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
                 }
             }
 
-            if (isIndexing) {
-                resultMessage += `\n\n💡 **Tip**: This codebase is still being indexed. More results may become available as indexing progresses.`;
+            // ── Graph-only mode: standalone graph results ──
+            if (graphResultText && searchMode === 'graph') {
+                resultMessage = `Graph hits for "${query}" in '${absolutePath}'${indexingStatusMessage}\n\n${graphResultText}`;
+            } else if (graphResultText && vectorResults.length === 0) {
+                resultMessage = `Graph-only hits for "${query}" (no vector matches)${indexingStatusMessage}\n\n${graphResultText}`;
             }
 
-            return {
-                content: [{
-                    type: "text",
-                    text: resultMessage
-                }]
-            };
+            if (isIndexing) {
+                resultMessage += `\n⚠️ Indexing in progress — results may be incomplete.`;
+            }
+
+            return { content: [{ type: "text", text: resultMessage }] };
         } catch (error) {
             // Check if this is the collection limit error
             // Handle both direct string throws and Error objects containing the message
@@ -1321,7 +1309,7 @@ export class ToolHandlers {
                 };
             }
 
-            await this.syncIndexedCodebasesFromCloud();
+            await this.syncCollectionState();
 
             // Check indexing status using new status system.
             //
@@ -1520,20 +1508,26 @@ export class ToolHandlers {
     private enrichWithGraphContextDeep(
         searchResults: any[],
         codebasePath: string,
-        maxContextFiles: number = 10,
+        query: string,
     ): string {
         const store = this.graphToolHandlers!.getStore();
         const project = getRepoIdentity(codebasePath);
         const lines: string[] = [];
         const seenSymbols = new Set<string>();
 
-        // Collect all unique file paths from search results
+        // Extract query keywords for symbol relevance filtering.
+        const queryWords = query.toLowerCase().split(/[\s_\-.,:;!?/\\()\[\]{}]+/).filter((w: string) => w.length > 1);
+        // heuristics for the top N matched files (reduced from 10 to avoid noise)
+        const maxFiles = 5;
+        const perFileLimit = 12;
+
+        // Collect unique file paths
         const seenFiles = new Set<string>();
-        for (const result of searchResults.slice(0, maxContextFiles)) {
+        for (const result of searchResults.slice(0, maxFiles)) {
             seenFiles.add(result.relativePath);
         }
 
-        // === Layer 1: Direct call relationships (batch-queried) ===
+        // === Layer 1: Direct call relationships (query-keyword filtered) ===
         const allNodeIds = new Set<number>();
         const fileNodes: Array<{ node: any; filePath: string }> = [];
 
@@ -1542,22 +1536,35 @@ export class ToolHandlers {
             let nodeResult = store.findNodes({
                 project,
                 exactFilePath: normalizedPath,
-                limit: 20,
+                limit: perFileLimit,
             });
             if (nodeResult.results.length === 0 && normalizedPath !== filePath) {
                 nodeResult = store.findNodes({
                     project,
                     exactFilePath: filePath,
-                    limit: 20,
+                    limit: perFileLimit,
                 });
             }
             for (const r of nodeResult.results) {
-                fileNodes.push({ node: r.node, filePath: normalizedPath });
-                allNodeIds.add(r.node.id);
+                const label = r.node.label;
+                // Drop noise: interfaces, types, variables — only keep callable symbols
+                if (label !== 'Function' && label !== 'Method' && label !== 'Class') continue;
+                // Drop unused symbols entirely
+                const nodeId = r.node.id;
+                // Quick check: if the symbol name contains any query keyword, or if
+                // it's in a hit file from search (always top-N results context)
+                const nameLower = r.node.name.toLowerCase();
+                const relevant = queryWords.length === 0 || queryWords.some((w: string) => nameLower.includes(w));
+                if (relevant) {
+                    fileNodes.push({ node: r.node, filePath: normalizedPath });
+                    allNodeIds.add(nodeId);
+                }
             }
         }
 
-        // Batch-collect all edges in one pass using batch queries
+        if (fileNodes.length === 0) return '';
+
+        // Batch edges
         const nodeIdsArr = fileNodes.map(f => f.node.id);
         const allCallerEdges = store.getEdgesByTargetBatch(nodeIdsArr, 'CALLS');
         const allCalleeEdges = store.getEdgesBySourceBatch(nodeIdsArr);
@@ -1567,7 +1574,6 @@ export class ToolHandlers {
             for (const e of allCalleeEdges.get(node.id) || []) allNodeIds.add(e.targetId);
         }
 
-        // Single batch lookup for all referenced nodes
         const nodeMap = store.getNodesById(Array.from(allNodeIds));
 
         const directRelations: string[] = [];
@@ -1579,129 +1585,54 @@ export class ToolHandlers {
             const callerEdges = allCallerEdges.get(node.id) || [];
             const calleeEdges = allCalleeEdges.get(node.id) || [];
 
-            const callerNames = callerEdges.slice(0, 3).map((e) => {
+            const callerNames = callerEdges.slice(0, 2).map((e) => {
                 const caller = nodeMap.get(e.sourceId);
                 return caller ? caller.name : '?';
             });
-            const calleeNames = calleeEdges.slice(0, 3).map((e) => {
+            const calleeNames = calleeEdges.slice(0, 2).map((e) => {
                 const callee = nodeMap.get(e.targetId);
                 return callee ? callee.name : '?';
             });
 
-            let line = `${node.label} \`${node.name}\``;
-            if (callerNames.length > 0) {
-                line += ` ← ${callerNames.join(', ')}`;
-                if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
-            }
-            if (calleeNames.length > 0) {
-                line += ` → ${calleeNames.join(', ')}`;
-                if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
-            }
-            if (callerEdges.length === 0 && calleeEdges.length === 0) {
-                line += ` [unused]`;
-            } else if (callerEdges.length === 0 && node.label === 'Function') {
-                line += ` [entry]`;
-            }
-            line += ` (${node.filePath}:${node.startLine})`;
+            let line = `\`${node.name}\``;
+            if (callerNames.length > 0) line += ` ← ${callerNames.join(', ')}`;
+            if (calleeNames.length > 0) line += ` → ${calleeNames.join(', ')}`;
+            if (callerEdges.length === 0 && calleeEdges.length === 0) continue; // skip truly isolated
+            line += `  (${node.filePath}:${node.startLine})`;
             directRelations.push(line);
         }
 
         if (directRelations.length > 0) {
-            lines.push('## Graph Context');
-            lines.push(...directRelations.map(l => `  - ${l}`));
+            lines.push('### Calls');
+            lines.push(...directRelations.map(l => `- ${l}`));
             lines.push('');
         }
 
-        // === Layer 2: Call chain trace (for top-ranked function) ===
-        for (const result of searchResults.slice(0, 3)) {
-            const normalizedPath = result.relativePath.replace(/^\/+/, '');
-            const nodeResult = store.findNodes({
-                project,
-                exactFilePath: normalizedPath,
-                limit: 5,
-            });
-            for (const r of nodeResult.results) {
-                if (r.node.label !== 'Function' && r.node.label !== 'Method') continue;
-                try {
-                    const traceResult = this.graphToolHandlers!.handleTracePath({
-                        project,
-                        function_name: r.node.qualifiedName,
-                        direction: 'both',
-                        depth: 3,
-                        mode: 'calls',
-                    });
-                    const traceText = traceResult.content[0]?.text || '';
-                    const traceLines = traceText.split('\n');
-                    const filtered = traceLines.filter((l: string) =>
-                        l.startsWith('  [depth=') || l.startsWith('Callers') || l.startsWith('Callees')
-                    );
-                    if (filtered.length > 0) {
-                        lines.push(`### Call Chain: \`${r.node.name}\``);
-                        lines.push(...filtered);
-                        lines.push('');
-                    }
-                } catch {
-                    // trace failure shouldn't affect main flow
-                }
-                break;
-            }
-            break;
-        }
-
-        // === Layer 3: Architecture summary (once per project per session) ===
-        // The architecture block is repo-level and stable; emitting it on every
-        // search wastes tokens. Emit only on the first search for this project.
+        // === Layer 2: Architecture (compact, once per session) ===
         if (!this.architectureEmitted.has(project)) {
           try {
-            const archResult = this.graphToolHandlers!.handleGetArchitecture({
-                project,
-            });
+            const archResult = this.graphToolHandlers!.handleGetArchitecture({ project });
             const archText = archResult.content[0]?.text || '';
             const archLines = archText.split('\n');
             const summary: string[] = [];
-            let inEntryPoints = false;
-            let inClusters = false;
-            let clusterCount = 0;
+            let inEntry = false, inCluster = false, entryCount = 0, clusterCount = 0;
             for (const line of archLines) {
-                if (line.startsWith('Entry points')) {
-                    inEntryPoints = true;
-                    summary.push(line);
-                    continue;
-                }
-                if (inEntryPoints && line.startsWith('  -')) {
-                    summary.push(line);
-                    continue;
-                }
-                if (inEntryPoints && !line.startsWith('  -')) {
-                    inEntryPoints = false;
-                }
-                if (line.startsWith('Clusters')) {
-                    inClusters = true;
-                    summary.push(line);
-                    continue;
-                }
-                if (inClusters && line.startsWith('  ') && clusterCount < 5) {
-                    summary.push(line);
-                    clusterCount++;
-                    continue;
-                }
-                if (inClusters && clusterCount >= 5) {
-                    inClusters = false;
-                }
+                if (line.startsWith('Entry points')) { inEntry = true; summary.push(line); continue; }
+                if (inEntry && line.startsWith('  -') && entryCount < 5) { summary.push(line); entryCount++; continue; }
+                if (inEntry && !line.startsWith('  -')) inEntry = false;
+                if (line.startsWith('Clusters')) { inCluster = true; summary.push(line); continue; }
+                if (inCluster && line.startsWith('  ') && clusterCount < 3) { summary.push(line); clusterCount++; continue; }
+                if (inCluster && clusterCount >= 3) inCluster = false;
             }
             if (summary.length > 0) {
                 lines.push('### Architecture');
                 lines.push(...summary);
                 lines.push('');
             }
-            // Mark emitted even if summary was empty — an empty architecture
-            // won't become useful on the next search, so don't retry every time.
             this.architectureEmitted.add(project);
-          } catch {
-            // architecture failure shouldn't affect main flow
-          }
+          } catch {}
         }
 
-        return lines.length > 0 ? '\n\n' + lines.join('\n') : '';
+        return lines.length > 0 ? '\n' + lines.join('\n') : '';
     }
 } 

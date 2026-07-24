@@ -8,7 +8,7 @@ import {
     HybridSearchOptions,
     HybridSearchResult,
 } from './types';
-import { ClusterManager } from './zilliz-utils';
+import { ClusterManager } from './cluster-utils';
 
 export interface MilvusConfig {
     address?: string;
@@ -737,47 +737,27 @@ export class MilvusVectorDatabase implements VectorDatabase {
         }
 
         try {
-            // Generate OpenAI embedding for the first search request (dense)
-            console.log(`[MilvusDB] 🔍 Preparing hybrid search for collection: ${collectionName}`);
-
-            // Prepare search requests in the correct Milvus format
+            // Build search params
             const search_param_1 = {
                 data: Array.isArray(searchRequests[0].data) ? searchRequests[0].data : [searchRequests[0].data],
-                anns_field: searchRequests[0].anns_field, // "vector"
-                param: searchRequests[0].param, // {"nprobe": 10}
+                anns_field: searchRequests[0].anns_field,
+                param: searchRequests[0].param,
                 limit: searchRequests[0].limit
             };
 
             const search_param_2 = {
-                data: searchRequests[1].data, // query text for sparse search
-                anns_field: searchRequests[1].anns_field, // "sparse_vector"
-                param: searchRequests[1].param, // {"drop_ratio_search": 0.2}
+                data: searchRequests[1].data,
+                anns_field: searchRequests[1].anns_field,
+                param: searchRequests[1].param,
                 limit: searchRequests[1].limit
             };
 
-            // Set rerank strategy to RRF (100) by default
             const rerank_strategy = {
                 strategy: "rrf",
-                params: {
-                    k: 100
-                }
+                params: { k: 100 }
             };
 
-            console.log(`[MilvusDB] 🔍 Dense search params:`, JSON.stringify({
-                anns_field: search_param_1.anns_field,
-                param: search_param_1.param,
-                limit: search_param_1.limit,
-                data_length: Array.isArray(search_param_1.data[0]) ? search_param_1.data[0].length : 'N/A'
-            }, null, 2));
-            console.log(`[MilvusDB] 🔍 Sparse search params:`, JSON.stringify({
-                anns_field: search_param_2.anns_field,
-                param: search_param_2.param,
-                limit: search_param_2.limit,
-                query_text: typeof search_param_2.data === 'string' ? search_param_2.data.substring(0, 50) + '...' : 'N/A'
-            }, null, 2));
-            console.log(`[MilvusDB] 🔍 Rerank strategy:`, JSON.stringify(rerank_strategy, null, 2));
-
-            // Execute hybrid search using the correct client.search format
+            // Execute hybrid search
             const searchParams: any = {
                 collection_name: collectionName,
                 data: [search_param_1, search_param_2],
@@ -790,20 +770,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 searchParams.expr = options.filterExpr;
             }
 
-            console.log(`[MilvusDB] 🔍 Complete search request:`, JSON.stringify({
-                collection_name: searchParams.collection_name,
-                data_count: searchParams.data.length,
-                limit: searchParams.limit,
-                rerank: searchParams.rerank,
-                output_fields: searchParams.output_fields,
-                expr: searchParams.expr
-            }, null, 2));
-
             const searchResult = await this.withLoadRetry(collectionName, () =>
                 this.client!.search(searchParams)
             );
-
-            console.log(`[MilvusDB] 🔍 Search executed, processing results...`);
 
             if (!searchResult.results || searchResult.results.length === 0) {
                 console.log(`[MilvusDB] ⚠️  No results returned from Milvus search`);

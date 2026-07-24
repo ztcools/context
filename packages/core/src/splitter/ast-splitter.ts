@@ -33,22 +33,28 @@ function loadParser(name: string): any {
     }
 }
 
-// Node types that represent logical code units
+// Node types that represent logical code units.
+// Note: interface_declaration and type_alias_declaration are intentionally
+// EXCLUDED — they contain zero implementation logic. Splitting them out as
+// independent chunks poisons search results with type-only noise (e.g. a
+// "search" query matching SearchCodeResult's interface declaration).
+// They fall through to the parent's traversal and are only indexed as part
+// of a larger implementation chunk when no better split points exist.
 const SPLITTABLE_NODE_TYPES = {
-    javascript: ['function_declaration', 'arrow_function', 'class_declaration', 'method_definition', 'export_statement'],
-    typescript: ['function_declaration', 'arrow_function', 'class_declaration', 'method_definition', 'export_statement', 'interface_declaration', 'type_alias_declaration'],
+    javascript: ['function_declaration', 'arrow_function', 'class_declaration', 'method_definition'],
+    typescript: ['function_declaration', 'arrow_function', 'class_declaration', 'method_definition'],
     python: ['function_definition', 'class_definition', 'decorated_definition', 'async_function_definition'],
-    java: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration'],
-    cpp: ['function_definition', 'class_specifier', 'namespace_definition', 'declaration'],
+    java: ['method_declaration', 'class_declaration', 'constructor_declaration'],
+    cpp: ['function_definition', 'class_specifier', 'namespace_definition'],
     go: ['function_declaration', 'method_declaration', 'type_declaration', 'var_declaration', 'const_declaration'],
     rust: ['function_item', 'impl_item', 'struct_item', 'enum_item', 'trait_item', 'mod_item'],
-    csharp: ['method_declaration', 'class_declaration', 'interface_declaration', 'struct_declaration', 'enum_declaration'],
-    scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration']
+    csharp: ['method_declaration', 'class_declaration', 'struct_declaration', 'enum_declaration'],
+    scala: ['method_declaration', 'class_declaration', 'constructor_declaration']
 };
 
 export class AstCodeSplitter implements Splitter {
-    private chunkSize: number = 2500;
-    private chunkOverlap: number = 300;
+    private chunkSize: number = 4000;
+    private chunkOverlap: number = 500;
     private parser: Parser;
     private langchainFallback: any; // LangChainCodeSplitter for fallback
 

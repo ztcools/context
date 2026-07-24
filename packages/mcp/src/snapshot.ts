@@ -184,7 +184,7 @@ export class SnapshotManager {
 
     /**
      * Read the snapshot file with a short-lived cache to avoid repeated I/O
-     * within the same call chain (e.g. syncIndexedCodebasesFromCloud calls
+     * within the same call chain (e.g. syncCollectionState calls
      * getIndexedCodebases multiple times).
      */
     private readSnapshotCached(): CodebaseSnapshot | null {
@@ -219,7 +219,7 @@ export class SnapshotManager {
         // include in-memory entries that may have been added since last save.
         // IMPORTANT: in-memory state overrides file — if a codebase is "indexing"
         // in memory, it must NOT appear in the "indexed" list even if the stale
-        // file still says "indexed". Otherwise syncIndexedCodebasesFromCloud
+        // file still says "indexed". Otherwise syncCollectionState
         // will removeCodebaseCompletely() and wipe the in-memory indexing state.
         const result = new Set<string>();
 

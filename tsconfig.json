@@ -37,12 +37,6 @@
             "path": "./packages/graph"
         },
         {
-            "path": "./packages/vscode-extension"
-        },
-        {
-            "path": "./packages/chrome-extension"
-        },
-        {
             "path": "./packages/mcp"
         }
     ],

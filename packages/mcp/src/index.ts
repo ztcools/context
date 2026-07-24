@@ -96,18 +96,27 @@ Index a codebase for intelligent code search. One call builds both the vector in
         // deliberately directive. Keep the guidance honest — every claim here is
         // backed by the handler (hybrid vector+BM25 ranking, graph enrichment).
         const search_description = `
-Semantic + knowledge-graph search over the indexed codebase. This is the FASTEST and most reliable way to understand THIS project — prefer it over reading files, grepping, or guessing. A single call returns the most relevant code snippets ranked across the whole repo, each enriched with graph context: callers, callees, call chains, architectural role, and dead-code flags.
+Semantic + knowledge-graph search over the indexed codebase.
 
-🎯 **Call this FIRST — before reading files — whenever you need to:**
-- Locate where something is implemented, or how a feature/flow works
-- Understand code BEFORE editing it (find existing patterns, conventions, related logic to stay consistent)
-- Trace a bug to its root cause (you get the full call chain, not a single file)
-- Judge blast radius before refactoring (who calls this? what does it call?)
-- Answer any "where / how / why" question about the codebase
+**Modes:**
+- \`both\` (default) — vector semantic + graph symbol search together
+- \`vector\` — semantic search only (no graph; "how/where is X implemented")
+- \`graph\` — symbol search only ("who calls X")
 
-💡 **Why prefer it:** one search replaces many file reads. It ranks by *meaning* across the entire repository (not just filename or exact-token matches) and attaches the call graph, so you get the code AND how it connects — context that would otherwise take many tool calls to reconstruct. Reach for it liberally; a quick search at the start of a task keeps your edits grounded in how the project actually works.
+**Output control (both mode):**
+- \`enrich: true\` (default) — append call-relationship context
+- \`style: 'compact'\` — only file:line locations, no code snippets
 
-Use natural-language queries describing intent (e.g. "how are auth tokens refreshed", "where is the vector DB connection configured"), not bare keywords. Run several focused searches for a multi-part task.
+🎯 **When:**
+- Finding where something is implemented (unknown path)
+- Understanding an unfamiliar subsystem
+- Tracing call relationships (graph mode)
+
+🚫 **Skip — use Read/grep instead:**
+- File path already known (from CLAUDE.md or recent reads) → read directly
+- Exact symbol/string known → grep, faster and zero-cost
+
+Query in natural language (e.g. "how are auth tokens refreshed").
 `;
 
         this.server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -174,6 +183,23 @@ Use natural-language queries describing intent (e.g. "how are auth tokens refres
                                     items: { type: "string" },
                                     description: "Filter by file extensions (e.g. ['.ts', '.py'])",
                                     default: [],
+                                },
+                                mode: {
+                                    type: "string",
+                                    enum: ["vector", "graph", "both"],
+                                    description: "Search mode: 'vector' (semantic), 'graph' (symbol), 'both' (default).",
+                                    default: "both",
+                                },
+                                enrich: {
+                                    type: "boolean",
+                                    description: "Attach graph call-relationship context to results (both mode only, default true). Set false for lean output.",
+                                    default: true,
+                                },
+                                style: {
+                                    type: "string",
+                                    enum: ["full", "compact"],
+                                    description: "'full' (default) returns code snippets; 'compact' returns only file:line locations.",
+                                    default: "full",
                                 },
                             },
                             required: ["query"],

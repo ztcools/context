@@ -85,7 +85,10 @@ export class FileSynchronizer {
         return crypto.createHash('sha256').update(content).digest('hex');
     }
 
-    private async generateFileHashes(dir: string): Promise<Map<string, string>> {
+    private async generateFileHashes(
+        dir: string,
+        onProgress?: (current: number, total: number) => void,
+    ): Promise<Map<string, string>> {
         const fileHashes = new Map<string, string>();
 
         // Try git ls-files first — respects .gitignore and is much faster.
@@ -97,19 +100,29 @@ export class FileSynchronizer {
             }
             const extSet = new Set(this.supportedExtensions);
             const nameSet = new Set(this.supportedFilenames);
+            // 50MB buffer to handle very large repos without falling back to
+            // the slower filesystem walk (10MB was too small for 100K+ files).
             const output = execSync(
                 `git -C "${dir}" ls-files --cached --others --exclude-standard`,
-                { encoding: 'utf-8', timeout: 10_000, maxBuffer: 10 * 1024 * 1024 }
+                { encoding: 'utf-8', timeout: 15_000, maxBuffer: 50 * 1024 * 1024 }
             );
             files = output.trim().split('\n').filter(Boolean)
                 .filter(f => extSet.has(path.extname(f)) || nameSet.has(path.basename(f)))
                 .map(f => path.join(dir, f));
         } catch {
             // Fallback: filesystem walk
-            return await this.generateFileHashesFromFS(dir);
+            return await this.generateFileHashesFromFS(dir, onProgress);
         }
 
+        const total = files.length;
+        let processed = 0;
+        // Report every N files to avoid callback overhead dominating the hot loop.
+        const reportInterval = Math.max(1, Math.floor(total / 100));
         for (const fullPath of files) {
+            processed++;
+            if (onProgress && processed % reportInterval === 0) {
+                onProgress(processed, total);
+            }
             if (!fsSync.existsSync(fullPath)) continue;
             const relativePath = path.relative(this.rootDir, fullPath).replace(/\\/g, '/');
             if (this.shouldIgnore(relativePath)) continue;
@@ -120,10 +133,14 @@ export class FileSynchronizer {
                 console.warn(`[Synchronizer] Cannot hash file ${relativePath}: ${error.message}`);
             }
         }
+        if (onProgress) onProgress(total, total);
         return fileHashes;
     }
 
-    private async generateFileHashesFromFS(dir: string): Promise<Map<string, string>> {
+    private async generateFileHashesFromFS(
+        dir: string,
+        onProgress?: (current: number, total: number) => void,
+    ): Promise<Map<string, string>> {
         const fileHashes = new Map<string, string>();
 
         let entries;
@@ -155,7 +172,11 @@ export class FileSynchronizer {
             if (stat.isDirectory()) {
                 // Verify it's really a directory and not ignored
                 if (!this.shouldIgnore(relativePath)) {
-                    const subHashes = await this.generateFileHashes(fullPath);
+                    // Recurse with generateFileHashesFromFS directly — calling
+                    // generateFileHashes would try git ls-files from the subdirectory,
+                    // which returns repo-root-relative paths that produce wrong
+                    // absolute paths when joined with the subdirectory (double-prefix).
+                    const subHashes = await this.generateFileHashesFromFS(fullPath, onProgress);
                     const entries = Array.from(subHashes.entries());
                     for (let i = 0; i < entries.length; i++) {
                         const [p, h] = entries[i];
@@ -240,16 +261,27 @@ export class FileSynchronizer {
 
     private buildMerkleDAG(fileHashes: Map<string, string>): MerkleDAG {
         const dag = new MerkleDAG();
+        if (fileHashes.size === 0) return dag;
+
         const sortedPaths = Array.from(fileHashes.keys()).slice().sort();
 
-        // Root hash = hash of all (path, fileHash) pairs — compact representation.
-        const rootData = sortedPaths.map(p => `${p}:${fileHashes.get(p)}`).join(',');
-        const rootNodeId = dag.addNode(`root:${rootData}`);
-
-        // Add each file as a leaf child of the root.
-        for (const path of sortedPaths) {
-            dag.addNode(`${path}:${fileHashes.get(path)}`, rootNodeId);
+        // Incremental streaming hash — avoids creating a 20MB+ root data
+        // string (O(paths × avg-path-len)) which bloated memory, slowed
+        // JSON serialization, and could cause the event loop to stall.
+        const rootHasher = crypto.createHash('sha256');
+        rootHasher.update('root:');
+        for (const p of sortedPaths) {
+            rootHasher.update(p);
+            rootHasher.update(':');
+            rootHasher.update(fileHashes.get(p)!);
+            rootHasher.update(',');
         }
+        const rootHash = rootHasher.digest('hex');
+
+        // Compact root node — the leaf nodes were never used individually;
+        // only the root hash matters for the "anything changed?" quick check
+        // in MerkleDAG.compare. Individual file diffs come from compareStates.
+        dag.addNode(`root:v2:${fileHashes.size}:${rootHash}`);
 
         return dag;
     }
@@ -261,10 +293,17 @@ export class FileSynchronizer {
         console.log(`[Synchronizer] File synchronizer initialized. Loaded ${this.fileHashes.size} file hashes.`);
     }
 
-    public async checkForChanges(): Promise<{ added: string[], removed: string[], modified: string[] }> {
+    public async checkForChanges(
+        onProgress?: (phase: string, current: number, total: number) => void,
+    ): Promise<{ added: string[], removed: string[], modified: string[] }> {
         console.log('[Synchronizer] Checking for file changes...');
 
-        const newFileHashes = await this.generateFileHashes(this.rootDir);
+        onProgress?.('Scanning files', 0, 1);
+        const newFileHashes = await this.generateFileHashes(this.rootDir,
+            (current, total) => onProgress?.('Hashing files', current, total),
+        );
+
+        onProgress?.('Building Merkle tree', 0, 1);
         const newMerkleDAG = this.buildMerkleDAG(newFileHashes);
 
         // Compare the DAGs

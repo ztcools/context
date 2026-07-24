@@ -19,7 +19,7 @@ import {
     HybridSearchResult,
     COLLECTION_LIMIT_MESSAGE
 } from './types';
-import { ClusterManager } from './zilliz-utils';
+import { ClusterManager } from './cluster-utils';
 
 export interface MilvusRestfulConfig {
     address?: string;
@@ -775,10 +775,8 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         try {
             const restfulConfig = this.config as MilvusRestfulConfig;
 
-            console.log(`[MilvusRestfulDB] 🔍 Preparing hybrid search for collection: ${collectionName}`);
-
-            // Prepare search requests according to Milvus REST API hybrid search specification
-            // For dense vector search - data must be array of vectors: [[0.1, 0.2, 0.3, ...]]
+            // Prepare search requests for Milvus REST API hybrid search
+            // For dense vector search - data must be array of vectors
             const search_param_1: any = {
                 data: Array.isArray(searchRequests[0].data) ? [searchRequests[0].data] : [[searchRequests[0].data]],
                 annsField: searchRequests[0].anns_field, // "vector"
@@ -810,23 +808,8 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
 
             const rerank_strategy = {
                 strategy: "rrf",
-                params: {
-                    k: 100
-                }
+                params: { k: 100 }
             };
-
-            console.log(`[MilvusRestfulDB] 🔍 Dense search params:`, JSON.stringify({
-                annsField: search_param_1.annsField,
-                limit: search_param_1.limit,
-                data_length: Array.isArray(search_param_1.data[0]) ? search_param_1.data[0].length : 'N/A',
-                searchParams: search_param_1.searchParams
-            }, null, 2));
-            console.log(`[MilvusRestfulDB] 🔍 Sparse search params:`, JSON.stringify({
-                annsField: search_param_2.annsField,
-                limit: search_param_2.limit,
-                query_text: typeof search_param_2.data[0] === 'string' ? search_param_2.data[0].substring(0, 50) + '...' : 'N/A',
-                searchParams: search_param_2.searchParams
-            }, null, 2));
 
             const hybridSearchRequest: any = {
                 collectionName,
@@ -837,7 +820,6 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                 outputFields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
             };
 
-            console.log(`[MilvusRestfulDB] 🔍 Executing REST API hybrid search...`);
             const response = await this.makeRequest('/entities/hybrid_search', 'POST', hybridSearchRequest);
 
             if (response.code !== 0) {

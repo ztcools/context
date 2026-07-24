@@ -96,8 +96,8 @@ const DEFAULT_SUPPORTED_EXTENSIONS = [
     '.html', '.htm', '.css', '.scss', '.less', '.sass',
     // Database
     '.sql',
-    // Text and markup files
-    '.md', '.markdown', '.rst', '.adoc', '.txt', '.ipynb',
+    // Text and markup files (markdown excluded — doc noise in search results)
+    '.rst', '.adoc', '.txt', '.ipynb',
 ];
 
 // Well-known extensionless files that should be indexed as code/config.
@@ -143,15 +143,41 @@ const DEFAULT_IGNORE_PATTERNS = [
     // Dependency directories
     'vendor/**',
     'bower_components/**',
+    // Python pip packages (site-packages in any virtualenv or system path)
+    '**/site-packages/**',
+    // Node.js alternative package managers
+    '.pnpm-store/**',
 
-    // C/C++ & CMake build trees
+    // ---- Java / Kotlin / Scala ----
+    '.gradle/**',
+    '.mvn/**',
+    '.kotlin/**',
+    'classes/**',
+    '**/*.class',
+    '**/*.jar',
+    '**/*.war',
+    '**/*.ear',
+
+    // ---- Python (additional) ----
+    '**/*.egg',
+    '**/*.whl',
+    '.python-version',
+
+    // ---- C/C++ & CMake build trees ----
     'cmake-build-*/**',
     'CMakeFiles/**',
     '_build/**',
     '**/*.o', '**/*.obj', '**/*.a', '**/*.lib', '**/*.so', '**/*.so.*',
     '**/*.dylib', '**/*.dll', '**/*.exe', '**/*.out', '**/*.d',
+    '**/*.lo', '**/*.la',  // libtool objects / archives
     // Bazel
     'bazel-*/**',
+    // CMake FetchContent / vcpkg / conan / CPM
+    '_deps/**',
+    '.conan/**',
+    // Vendored third-party libraries (common in C/C++/protobuf-grpc projects)
+    'third_party/**',
+    'external/**',  // Bazel external repositories
     // ROS / catkin / colcon workspaces (generated)
     'devel/**',
     'install/**',
@@ -168,6 +194,65 @@ const DEFAULT_IGNORE_PATTERNS = [
     'venv/**',
     '.venv/**',
     '**/*.pyc', '**/*.pyo', '**/*.pyd',
+
+    // ---- Ruby ----
+    '.bundle/**',
+    'vendor/bundle/**',
+
+    // ---- Elixir ----
+    'deps/**',
+    '.elixir_ls/**',
+
+    // ---- Go (additional) ----
+    // 'vendor/**' already covered above; Go workspace:
+    'go.work.sum',
+
+    // ---- Rust (additional) ----
+    // 'target/**' already covered above
+
+    // ---- Dart / Flutter ----
+    '.dart_tool/**',
+    '.flutter-plugins*',
+    '.packages',
+
+    // ---- JavaScript / TypeScript (additional) ----
+    '*.tsbuildinfo',
+    '__snapshots__/**',
+    '.storybook-static/**',
+    'storybook-static/**',
+    // Code generation output dirs (various ecosystems)
+    'generated/**',
+    '_generated/**',
+    '**/*.generated.*',
+    // Static site generators
+    '_site/**',
+    '.docusaurus/**',
+    // Serverless deployment artifacts
+    '.serverless/**',
+    '.wrangler/**',
+
+    // ---- Embedded / IoT ----
+    '.pio/**',        // PlatformIO
+    '.pioenvs/**',
+
+    // ---- Game engines ----
+    // Unity
+    'Library/**',
+    'Temp/**',
+    'Obj/**',
+    'Logs/**',
+    // Unreal Engine
+    'Intermediate/**',
+    'Saved/**',
+    'DerivedDataCache/**',
+    // Godot
+    '.godot/**',
+    '.import/**',
+
+    // ---- OS junk files ----
+    '.DS_Store',
+    'Thumbs.db',
+    'desktop.ini',
 
     // Models / weights / serialized graphs (large binaries)
     '**/*.onnx', '**/*.pt', '**/*.pth', '**/*.pb', '**/*.h5', '**/*.hdf5',
@@ -286,7 +371,7 @@ export class Context {
         }
         this.vectorDatabase = config.vectorDatabase;
 
-        this.codeSplitter = config.codeSplitter || new AstCodeSplitter(2500, 300);
+        this.codeSplitter = config.codeSplitter || new AstCodeSplitter(4000, 500);
 
         // Load custom extensions from environment variables
         const envCustomExtensions = this.getCustomExtensionsFromEnv();
@@ -526,12 +611,11 @@ export class Context {
             return `${prefix}_${suffix}`;
         }
 
-        // Human-readable, attu-friendly: <prefix>_<repo>_<hash>. The repo slug surfaces the
-        // source right in the name (the old long "hybrid_code_chunks_" prefix buried it behind
-        // attu's column truncation); the branch is intentionally NOT in the name — a repo's
-        // main and all its branches read as the same repo, and the branch hierarchy is shown
-        // in the dedicated index-tree UI + the collection description. The hash keeps names
-        // unique and deterministic per identity (index-time and search-time agree).
+        // Collection naming: <prefix>_<repo>_<hash>. The repo slug makes it human-
+        // readable; the branch is intentionally NOT in the name so a repo's main
+        // and all its branches read as the same repo. The branch hierarchy is shown
+        // in the collection description. The hash keeps names unique and
+        // deterministic per identity (index-time and search-time agree).
         const slug = this.slugForIdentity(identity);
         return `${prefix}_${slug}_${pathHash}`;
     }
@@ -882,7 +966,7 @@ export class Context {
 
         console.log(`[Context] 🌿 Branch delta index for ${identity}: base(root)=${root.identity}, parent=${lineage.parentIdentity} (+${diff.added.length}/~${diff.modified.length}/-${diff.deleted.length})`);
 
-        // Fresh delta collection (parent pointer embedded in description for the Attu tree).
+        // Fresh delta collection (parent pointer embedded in description for branch tracking).
         await this.prepareCollection(codebasePath, false, lineage.parentIdentity);
         this.currentIndexCommit = head;
 
@@ -1826,7 +1910,7 @@ export class Context {
         // Description = `codebasePath:<identity>` for a root branch, plus `|tracks:<branch>`
         // for a sub-branch naming the branch it tracks (its immediate parent). Lets the
         // index-tree UI reconstruct the branch-tracking chain (A ← B ← C). Keeps the
-        // `codebasePath:` prefix that cloud-sync parses (everything before the first `|`).
+        // `codebasePath:` prefix for collection description parse (everything before first `|`).
         const repoUrl = getRemoteUrl(codebasePath);
         const trackedBranch = parentIdentity && repoUrl ? this.branchOf(parentIdentity, repoUrl) : '';
         const description = trackedBranch

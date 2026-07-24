@@ -16,11 +16,11 @@ export { MilvusRestfulVectorDatabase, MilvusRestfulConfig } from './milvus-restf
 export { MilvusVectorDatabase, MilvusConfig } from './milvus-vectordb';
 export {
     ClusterManager,
-    ZillizConfig,
+    ClusterConfig,
     Project,
     Cluster,
     CreateFreeClusterRequest,
     CreateFreeClusterResponse,
     CreateFreeClusterWithDetailsResponse,
     DescribeClusterResponse
-} from './zilliz-utils'; 
+} from './cluster-utils';
